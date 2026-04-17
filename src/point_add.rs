@@ -2215,7 +2215,7 @@ fn kaliski_iteration(
 
     // ─── STEP 2: with l = u > v_w: a ^= (f AND l AND ¬b); m_i ^= same.
     // Late-iter: u and v_w have bitlen ≤ 2n-iter, so only compare low 2n-iter bits.
-    let cmp_width = if iter_idx < n { n } else { 2 * n - iter_idx };
+    let cmp_width = if iter_idx < n { n } else { 2 * n - iter_idx - 1 };
     let l_gt = b.alloc_qubit();
     with_gt(b, &u[0..cmp_width], &v_w[0..cmp_width], l_gt, |b| {
         b.x(b_f);                          // negate polarity of b_f
@@ -2673,7 +2673,7 @@ fn kaliski_iteration_backward(
     for j in (0..uv_width).rev() { cswap(b, a_f, u[j], v_w[j]); }
 
     // ── Reverse STEP 2 (with_gt body is self-inverse) ──────────────────
-    let cmp_width = if iter_idx < n { n } else { 2 * n - iter_idx };
+    let cmp_width = if iter_idx < n { n } else { 2 * n - iter_idx - 1 };
     let l_gt = b.alloc_qubit();
     with_gt(b, &u[0..cmp_width], &v_w[0..cmp_width], l_gt, |b| {
         b.x(b_f);
