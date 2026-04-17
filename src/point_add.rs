@@ -2442,13 +2442,13 @@ struct KaliskiState {
     add_flag: QubitId,
 }
 
-fn alloc_kaliski_state(b: &mut B, n: usize) -> KaliskiState {
+fn alloc_kaliski_state(b: &mut B, n: usize, iters: usize) -> KaliskiState {
     KaliskiState {
         u: b.alloc_qubits(n),
         v_w: b.alloc_qubits(n),
         r: b.alloc_qubits(n),
         s: b.alloc_qubits(n),
-        m_hist: b.alloc_qubits(2 * n - 114),
+        m_hist: b.alloc_qubits(iters),
         f_flag: b.alloc_qubit(),
         a_flag: b.alloc_qubit(),
         b_flag: b.alloc_qubit(),
@@ -2477,7 +2477,7 @@ fn free_kaliski_state(b: &mut B, st: KaliskiState) {
 /// The caller is responsible for applying the classical correction factor
 /// `K = 2^{-2n} mod p` and for calling `emit_inverse(kaliski_forward)` to
 /// restore `st.*` to all zero.
-fn kaliski_forward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256) {
+fn kaliski_forward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iters: usize) {
     let n = v_in.len();
 
     // ─── Init ───
@@ -2490,8 +2490,8 @@ fn kaliski_forward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256) {
     // f := 1
     b.x(st.f_flag);
 
-    // ─── 2n iterations ───
-    for i in 0..(2 * n - 114) {
+    // ─── iter count iterations ───
+    for i in 0..iters {
         kaliski_iteration(
             b, p, &st.u, &st.v_w, &st.r, &st.s,
             st.m_hist[i],
@@ -2755,11 +2755,11 @@ fn kaliski_iteration_backward(
 
 /// Explicit backward pass for kaliski_forward. Uses measurement-based
 /// uncomputation to save ~511 CCX per iteration vs emit_inverse.
-fn kaliski_backward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256) {
+fn kaliski_backward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iters: usize) {
     let n = v_in.len();
 
-    // ─── Reverse 2n iterations (in reverse order) ───
-    for i in (0..(2 * n - 114)).rev() {
+    // ─── Reverse iter count iterations (in reverse order) ───
+    for i in (0..iters).rev() {
         kaliski_iteration_backward(
             b, p, &st.u, &st.v_w, &st.r, &st.s,
             st.m_hist[i],
@@ -2787,19 +2787,20 @@ fn with_kal_inv_raw<F: FnOnce(&mut B, &[QubitId])>(
     b: &mut B,
     v_in: &[QubitId],
     p: U256,
+    iters: usize,
     body: F,
 ) {
     let n = v_in.len();
-    let st = alloc_kaliski_state(b, n);
+    let st = alloc_kaliski_state(b, n, iters);
 
-    // Forward kaliski. st.r[..n] holds raw = v_in^{-1} * 2^(2n) mod p.
-    kaliski_forward(b, v_in, &st, p);
+    // Forward kaliski. st.r[..n] holds raw = v_in^{-1} * 2^iters mod p.
+    kaliski_forward(b, v_in, &st, p, iters);
 
     let r_low: Vec<QubitId> = st.r[..n].to_vec();
     body(b, &r_low);
     // Explicit backward pass (uses measurement-based uncompute, saves
     // ~511 CCX per iteration vs the emit_inverse version).
-    kaliski_backward(b, v_in, &st, p);
+    kaliski_backward(b, v_in, &st, p, iters);
 
     free_kaliski_state(b, st);
 }
@@ -2808,29 +2809,29 @@ fn with_kal_inv<F: FnOnce(&mut B, &[QubitId])>(
     b: &mut B,
     v_in: &[QubitId],
     p: U256,
+    iters: usize,
     body: F,
 ) {
-    let n = v_in.len();
-    with_kal_inv_raw(b, v_in, p, |b, inv_raw| {
-        // Kaliski's raw output carries a 2^(2n-1) factor. Apply the
+    with_kal_inv_raw(b, v_in, p, iters, |b, inv_raw| {
+        // Kaliski's raw output carries a 2^iters factor. Apply the
         // correction in place when callers need the exact inverse.
-        for _ in 0..(2 * n - 114) { mod_halve_inplace_fast(b, inv_raw, p); }
+        for _ in 0..iters { mod_halve_inplace_fast(b, inv_raw, p); }
         body(b, inv_raw);
-        for _ in 0..(2 * n - 114) { mod_double_inplace_fast(b, inv_raw, p); }
+        for _ in 0..iters { mod_double_inplace_fast(b, inv_raw, p); }
     });
 }
 
-fn kaliski_inv_inplace(b: &mut B, v_in: &[QubitId], p: U256) {
+fn kaliski_inv_inplace(b: &mut B, v_in: &[QubitId], p: U256, iters: usize) {
     let n = v_in.len();
 
     // Bennett compute-copy-uncompute pattern. Each call of
     // `kaliski_inv_inplace` maps v_in ↔ v_in^{-1} (involution), with
     // internal scratch fully zeroed by function end.
-    let st = alloc_kaliski_state(b, n);
+    let st = alloc_kaliski_state(b, n, iters);
     let output = b.alloc_qubits(n);
 
     // ─── Phase 1: compute inverse of v_in into output ───
-    kaliski_forward(b, v_in, &st, p);
+    kaliski_forward(b, v_in, &st, p, iters);
     // st.r[..n] now holds raw inverse (in mod 2p, low n bits).
     // Apply classical correction: st.r[..n] *= K mod p, where K = 2^{-2n} mod p.
     let two_2n = pow_mod_2_k(p, 2 * n);
@@ -2841,7 +2842,7 @@ fn kaliski_inv_inplace(b: &mut B, v_in: &[QubitId], p: U256) {
     // Undo the correction: st.r[..n] *= K^{-1} mod p.
     in_place_mul_const(b, &st.r[..n], two_2n, p);
     // Now st is back to its post-kaliski_forward state. Reverse the forward.
-    emit_inverse(b, |b| kaliski_forward(b, v_in, &st, p));
+    emit_inverse(b, |b| kaliski_forward(b, v_in, &st, p, iters));
     // st is all 0 again. v_in unchanged. output = v_in^{-1}.
 
     // Swap v_in and output.
@@ -2852,11 +2853,11 @@ fn kaliski_inv_inplace(b: &mut B, v_in: &[QubitId], p: U256) {
     // Compute inverse of current v_in (which is v_orig^{-1}), = v_orig,
     // and XOR it into output. Since output currently = v_orig, the XOR
     // zeroes output.
-    kaliski_forward(b, v_in, &st, p);
+    kaliski_forward(b, v_in, &st, p, iters);
     in_place_mul_const(b, &st.r[..n], k_const, p);
     for i in 0..n { b.cx(st.r[i], output[i]); }   // output ^= v_orig = 0
     in_place_mul_const(b, &st.r[..n], two_2n, p);
-    emit_inverse(b, |b| kaliski_forward(b, v_in, &st, p));
+    emit_inverse(b, |b| kaliski_forward(b, v_in, &st, p, iters));
     // st all 0, output all 0 (hopefully), v_in = inverse.
 
     b.free_vec(&output);
@@ -2902,20 +2903,27 @@ pub fn build() -> Vec<Op> {
 
     let p = SECP256K1_P;
 
+    // Pair-specific Kaliski iteration counts. Each pair inverts a different
+    // quantum value (dx for pair 1, Rx-Ox for pair 2); their convergence
+    // distributions may differ slightly. Boundaries verified empirically
+    // against 9024 Fiat-Shamir shots.
+    const K1: usize = 2 * N - 114;  // pair 1 (invert dx)
+    const K2: usize = 2 * N - 114;  // pair 2 (invert Rx-Ox)
+
     // Step 1-2: Px -= Qx, Py -= Qy
     mod_sub_qb(b, &tx, &ox, p);
     mod_sub_qb(b, &ty, &oy, p);
 
     let lam = b.alloc_qubits(N);
 
-    // Pair 1: Kaliski's raw inverse carries a 2^(2N-1) factor. Fold that
+    // Pair 1: Kaliski's raw inverse carries a 2^K1 factor. Fold that
     // scale onto lam itself, then halve lam down once. This avoids the
     // inverse-register restore pass entirely.
-    with_kal_inv_raw(b, &tx, p, |b, inv_raw| {
+    with_kal_inv_raw(b, &tx, p, K1, |b, inv_raw| {
         // First mul: lam starts at 0, use zero-acc fast path (saves n-1 CCX).
         mod_mul_write_into_zero_acc_schoolbook(b, &lam, &ty, inv_raw, p);
-        // Halve 2N-1 times: lam = -λ.
-        for _ in 0..(2 * N - 114) { mod_halve_inplace_fast(b, &lam, p); }
+        // Halve K1 times: lam = -λ.
+        for _ in 0..K1 { mod_halve_inplace_fast(b, &lam, p); }
         // Second mul via schoolbook: ty += lam*tx = dy + (-λ)*dx = 0.
         mod_mul_add_into_acc_schoolbook(b, &ty, &lam, &tx, p);
     });
@@ -2931,10 +2939,15 @@ pub fn build() -> Vec<Op> {
     mod_neg_inplace_fast(b, &tx, p);                     // tx = -(...)= Rx - Qx
     // ty starts at 0 here (mul2 cleared it), use zero-acc fast path.
     mod_mul_write_into_zero_acc_schoolbook(b, &ty, &lam, &tx, p);
-    with_kal_inv_raw(b, &tx, p, |b, inv_raw| {
-        // Schoolbook approach: pre-double lam to -λ·2^(2N-1), then add
-        // inv_raw·ty mod p = +λ·2^(2N-1) → lam = 0.
-        for _ in 0..(2 * N - 114) { mod_double_inplace_fast(b, &lam, p); }
+    with_kal_inv_raw(b, &tx, p, K2, |b, inv_raw| {
+        // Pair 2 uses K2 doublings to match its own Kaliski scale factor.
+        // lam after mul 4 was scaled by 2^K1 from pair 1's halving. To make
+        // pair-2 uncompute work, we need the doubling count here to match
+        // pair-2's Kaliski scale (K2), AND we need the lam scale entering
+        // to already match. Since K1 == K2 currently, pre-lam is -λ (net
+        // scale 1 from pair 1). Doubling K2 times gives lam = -λ·2^K2,
+        // which cancels with mul5's +λ·2^K2 to zero lam.
+        for _ in 0..K2 { mod_double_inplace_fast(b, &lam, p); }
         mod_mul_add_into_acc_schoolbook(b, &lam, inv_raw, &ty, p);
         mod_sub_qb(b, &ty, &oy, p);                      // ty = (Ry+Qy) - Qy = Ry
     });
