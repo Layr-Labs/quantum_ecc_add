@@ -1190,10 +1190,25 @@ fn mod_mul_write_into_zero_acc_schoolbook(
 ) {
     let n = acc.len();
     debug_assert_eq!(n, 256);
+    let tmp_ext = b.alloc_qubits(2 * n);
+    mod_mul_write_into_zero_acc_schoolbook_with_tmp_ext(b, acc, x, y, p, &tmp_ext);
+    b.free_vec(&tmp_ext);
+}
+
+fn mod_mul_write_into_zero_acc_schoolbook_with_tmp_ext(
+    b: &mut B,
+    acc: &[QubitId],
+    x: &[QubitId],
+    y: &[QubitId],
+    p: U256,
+    tmp_ext: &[QubitId],
+) {
+    let n = acc.len();
+    debug_assert_eq!(n, 256);
+    debug_assert_eq!(tmp_ext.len(), 2 * n);
     let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
 
-    let tmp_ext = b.alloc_qubits(2 * n);
-    schoolbook_mul_into(b, x, y, &tmp_ext);
+    schoolbook_mul_into(b, x, y, tmp_ext);
 
     let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
     let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
@@ -1215,8 +1230,7 @@ fn mod_mul_write_into_zero_acc_schoolbook(
         mod_halve_inplace_fast(b, &hi, p);
     }
 
-    schoolbook_mul_into_inverse(b, x, y, &tmp_ext);
-    b.free_vec(&tmp_ext);
+    schoolbook_mul_into_inverse(b, x, y, tmp_ext);
 }
 
 fn cmod_add_qq(b: &mut B, acc: &[QubitId], a: &[QubitId], ctrl: QubitId, p: U256) {
@@ -1448,10 +1462,25 @@ fn mod_mul_add_into_acc_schoolbook(
 ) {
     let n = acc.len();
     debug_assert_eq!(n, 256);
+    let tmp_ext = b.alloc_qubits(2 * n);
+    mod_mul_add_into_acc_schoolbook_with_tmp_ext(b, acc, x, y, p, &tmp_ext);
+    b.free_vec(&tmp_ext);
+}
+
+fn mod_mul_add_into_acc_schoolbook_with_tmp_ext(
+    b: &mut B,
+    acc: &[QubitId],
+    x: &[QubitId],
+    y: &[QubitId],
+    p: U256,
+    tmp_ext: &[QubitId],
+) {
+    let n = acc.len();
+    debug_assert_eq!(n, 256);
+    debug_assert_eq!(tmp_ext.len(), 2 * n);
     let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
 
-    let tmp_ext = b.alloc_qubits(2 * n);
-    schoolbook_mul_into(b, x, y, &tmp_ext);
+    schoolbook_mul_into(b, x, y, tmp_ext);
 
     let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
     let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
@@ -1473,8 +1502,7 @@ fn mod_mul_add_into_acc_schoolbook(
         mod_halve_inplace_fast(b, &hi, p);
     }
 
-    schoolbook_mul_into_inverse(b, x, y, &tmp_ext);
-    b.free_vec(&tmp_ext);
+    schoolbook_mul_into_inverse(b, x, y, tmp_ext);
 }
 
 /// Symmetric schoolbook for squaring: x² = sum_i x[i]·2^(2i) + sum_{i<j} 2·x[i]·x[j]·2^(i+j).
@@ -1558,10 +1586,8 @@ fn squaring_sub_from_acc_schoolbook(
     let n = acc.len();
     debug_assert_eq!(n, 256);
     debug_assert_eq!(x.len(), n);
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-
-    // Wide accumulator (2n bits) starts at 0.
     let tmp_ext = b.alloc_qubits(2 * n);
+    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
 
     // Phase 1: symmetric schoolbook tmp_ext = x*x (~half the CCX of full).
     schoolbook_square_symmetric(b, x, &tmp_ext);
@@ -1591,7 +1617,6 @@ fn squaring_sub_from_acc_schoolbook(
 
     // Phase 3: uncompute tmp_ext via symmetric schoolbook inverse.
     schoolbook_square_symmetric_inverse(b, x, &tmp_ext);
-
     b.free_vec(&tmp_ext);
 }
 
@@ -2805,6 +2830,38 @@ fn with_kal_inv_raw<F: FnOnce(&mut B, &[QubitId])>(
     free_kaliski_state(b, st);
 }
 
+fn with_kal_inv_raw_scratch<F: FnOnce(&mut B, &[QubitId], &[QubitId])>(
+    b: &mut B,
+    v_in: &[QubitId],
+    p: U256,
+    iters: usize,
+    body: F,
+) {
+    let n = v_in.len();
+    let st = alloc_kaliski_state(b, n, iters);
+
+    kaliski_forward(b, v_in, &st, p, iters);
+
+    // The reduced-iteration Kaliski used here does not guarantee the full
+    // registers are (1, 0) on every shot, but the late-iteration width
+    // bounds do guarantee a zero tail on both u and v_w. Reuse only that
+    // provably-zero tail as scratch during the body.
+    let zero_tail_start = 2 * n - (iters - 1);
+    let scratch: Vec<QubitId> = st
+        .u
+        .iter()
+        .skip(zero_tail_start)
+        .copied()
+        .chain(st.v_w.iter().skip(zero_tail_start).copied())
+        .collect();
+    let r_low: Vec<QubitId> = st.r[..n].to_vec();
+    body(b, &r_low, &scratch);
+
+    kaliski_backward(b, v_in, &st, p, iters);
+
+    free_kaliski_state(b, st);
+}
+
 fn with_kal_inv<F: FnOnce(&mut B, &[QubitId])>(
     b: &mut B,
     v_in: &[QubitId],
@@ -2919,27 +2976,35 @@ pub fn build() -> Vec<Op> {
     // Pair 1: Kaliski's raw inverse carries a 2^K1 factor. Fold that
     // scale onto lam itself, then halve lam down once. This avoids the
     // inverse-register restore pass entirely.
-    with_kal_inv_raw(b, &tx, p, K1, |b, inv_raw| {
+    with_kal_inv_raw_scratch(b, &tx, p, K1, |b, inv_raw, scratch| {
+        let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
+        let mut tmp_ext = tmp_lo.clone();
+        tmp_ext.extend_from_slice(scratch);
         // First mul: lam starts at 0, use zero-acc fast path (saves n-1 CCX).
-        mod_mul_write_into_zero_acc_schoolbook(b, &lam, &ty, inv_raw, p);
+        mod_mul_write_into_zero_acc_schoolbook_with_tmp_ext(b, &lam, &ty, inv_raw, p, &tmp_ext);
         // Halve K1 times: lam = -λ.
         for _ in 0..K1 { mod_halve_inplace_fast(b, &lam, p); }
         // Second mul via schoolbook: ty += lam*tx = dy + (-λ)*dx = 0.
-        mod_mul_add_into_acc_schoolbook(b, &ty, &lam, &tx, p);
+        mod_mul_add_into_acc_schoolbook_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_ext);
+        b.free_vec(&tmp_lo);
     });
 
     // Px := λ² - Px_orig - Qx. Rearranged: tx = dx - λ². Add 2Qx, then
     // negate: -(dx - λ² + 2Qx) = λ² - dx - 2Qx = Rx. mod_add_qb is
     // cheaper than mod_sub_qb (1024 vs 1280 per call, saves 512 total).
-    mod_mul_sub_qq(b, &tx, &lam, &lam, p);
+    squaring_sub_from_acc_schoolbook(b, &tx, &lam, p);
     mod_add_double_qb(b, &tx, &ox, p);
     // Fold mod_neg + mod_sub_qb into mod_add_qb + mod_neg: mod_add_qb is
     // cheaper than mod_sub_qb by n CCX. Result equivalent: tx = Rx - Qx.
     mod_add_qb(b, &tx, &ox, p);                          // tx = dx - λ² + 3Qx
     mod_neg_inplace_fast(b, &tx, p);                     // tx = -(...)= Rx - Qx
-    // ty starts at 0 here (mul2 cleared it), use zero-acc fast path.
-    mod_mul_write_into_zero_acc_schoolbook(b, &ty, &lam, &tx, p);
-    with_kal_inv_raw(b, &tx, p, K2, |b, inv_raw| {
+    with_kal_inv_raw_scratch(b, &tx, p, K2, |b, inv_raw, scratch| {
+        let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
+        let mut tmp_ext = tmp_lo.clone();
+        tmp_ext.extend_from_slice(scratch);
+        // ty starts at 0 here (mul2 cleared it), so compute Ry+Qy inside the
+        // Kaliski body and reuse the borrowed zero tail as multiplier scratch.
+        mod_mul_write_into_zero_acc_schoolbook_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_ext);
         // Pair 2 uses K2 doublings to match its own Kaliski scale factor.
         // lam after mul 4 was scaled by 2^K1 from pair 1's halving. To make
         // pair-2 uncompute work, we need the doubling count here to match
@@ -2948,8 +3013,9 @@ pub fn build() -> Vec<Op> {
         // scale 1 from pair 1). Doubling K2 times gives lam = -λ·2^K2,
         // which cancels with mul5's +λ·2^K2 to zero lam.
         for _ in 0..K2 { mod_double_inplace_fast(b, &lam, p); }
-        mod_mul_add_into_acc_schoolbook(b, &lam, inv_raw, &ty, p);
+        mod_mul_add_into_acc_schoolbook_with_tmp_ext(b, &lam, inv_raw, &ty, p, &tmp_ext);
         mod_sub_qb(b, &ty, &oy, p);                      // ty = (Ry+Qy) - Qy = Ry
+        b.free_vec(&tmp_lo);
     });
     mod_add_qb(b, &tx, &ox, p);                           // tx = Rx
 
