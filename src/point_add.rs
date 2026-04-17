@@ -2162,7 +2162,7 @@ fn mulmod(a: U256, b: U256, p: U256) -> U256 {
 /// (since max(r,s) doubles per iter starting from max=1, so max ≤ 2^iter_idx).
 /// In that range, mod_double(r)'s Solinas cadd is identity — replace with
 /// a plain shift (0 Toffoli) for ~255 CCX savings per iter.
-const R_SMALL_THRESHOLD: usize = 255;
+const R_SMALL_THRESHOLD: usize = 256;
 
 fn kaliski_iteration(
     b: &mut B,
