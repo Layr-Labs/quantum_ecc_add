@@ -43,7 +43,7 @@ fn secp256k1() -> WeierstrassEllipticCurve {
 
 // ─── Test runner ───────────────────────────────────────────────────────────
 
-const NUM_TESTS: usize = 4096;
+const NUM_TESTS: usize = 9024;
 
 /// Hash the circuit's op stream into the seed XOF (Fiat-Shamir).
 ///
