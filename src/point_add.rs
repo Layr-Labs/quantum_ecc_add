@@ -792,6 +792,103 @@ fn cadd_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
     b.free_vec(&a);
 }
 
+/// Sparse-aware controlled add of classical constant c mod 2^n, via carry chain.
+/// acc += ctrl ? c : 0. Saves vs cadd_nbit_const_fast by avoiding the ancilla register.
+#[allow(dead_code)]
+fn cadd_nbit_const_sparse_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
+    let n = acc.len();
+    let mut first = 0usize;
+    while first < n && !bit(c, first) { first += 1; }
+    if first >= n { return; }
+
+    // Forward carry chain: carries[k] = carry INTO position first+1+k.
+    let mut carries: Vec<QubitId> = Vec::with_capacity(n - first);
+    // Initial carry at position first: c0 = ctrl AND acc[first]_old. acc[first] ^= ctrl.
+    let c0 = b.alloc_qubit();
+    b.ccx(ctrl, acc[first], c0);
+    b.cx(ctrl, acc[first]);
+    carries.push(c0);
+
+    for i in (first + 1)..n {
+        let prev = carries[carries.len() - 1];
+        // At top position (i=n-1), we only need sum; carry is discarded.
+        // Skip carry allocation there.
+        let is_last = i == n - 1;
+        if is_last {
+            if bit(c, i) {
+                // Sum only = a XOR p XOR c. Use existing qubits.
+                b.cx(prev, acc[i]);
+                b.cx(ctrl, acc[i]);
+            } else {
+                b.cx(prev, acc[i]);
+            }
+            // Nothing to push; no carry at top.
+            continue;
+        }
+        let new_carry = b.alloc_qubit();
+        if bit(c, i) {
+            // Full adder: sum = a XOR p XOR c, carry = maj(a, p, c).
+            b.cx(ctrl, acc[i]);
+            b.cx(ctrl, prev);
+            b.ccx(acc[i], prev, new_carry);
+            b.cx(ctrl, new_carry);
+            b.cx(prev, acc[i]);
+            b.cx(ctrl, prev);
+            b.cx(ctrl, acc[i]);
+        } else {
+            b.ccx(prev, acc[i], new_carry);
+            b.cx(prev, acc[i]);
+        }
+        carries.push(new_carry);
+    }
+
+    // Backward: uncompute carries in reverse. Skip the top-bit (no carry allocated there).
+    for i in (first + 1..n - 1).rev() {
+        let new_carry = carries.pop().unwrap();
+        let prev = carries[carries.len() - 1];
+        if bit(c, i) {
+            // Un-apply sum: acc[i] XOR c XOR prev_orig = ((a XOR p XOR c) XOR c) = a XOR p,
+            // then XOR prev to get a XOR c. But prev = p (unmodified, since previous backward iters restored).
+            // Actually, prev may be modified by the SET-BIT branch NOW if we're in it, but in THIS branch
+            // we control the flow.
+            // Steps to restore "at ccx(acc[i], prev, new_carry)" moment:
+            //   acc[i] was (a XOR c) at that moment; prev was (p XOR c); new_carry was (a XOR c)(p XOR c).
+            // Currently: acc[i] = sum = a XOR p XOR c; prev = p; new_carry = maj.
+            // Reverse chain:
+            b.cx(ctrl, acc[i]);     // acc[i] = (a XOR p XOR c) XOR c = a XOR p
+            b.cx(ctrl, prev);        // prev = p XOR c
+            b.cx(prev, acc[i]);     // acc[i] = (a XOR p) XOR (p XOR c) = a XOR c
+            b.cx(ctrl, new_carry);   // new_carry = maj XOR c = (a XOR c)(p XOR c)
+            let m = b.alloc_bit();
+            b.hmr(new_carry, m);     // new_carry → 0, phase += (a XOR c)(p XOR c) · m
+            b.cz_if(acc[i], prev, m);// phase += (a XOR c)(p XOR c) · m. Cancels.
+            // Restore acc[i] back to sum, prev back to p.
+            b.cx(prev, acc[i]);     // acc[i] = (a XOR c) XOR (p XOR c) = a XOR p
+            b.cx(ctrl, prev);        // prev = p
+            b.cx(ctrl, acc[i]);      // acc[i] = (a XOR p) XOR c = sum
+        } else {
+            // Forward was: ccx(prev, a, new_carry); cx(prev, a).
+            // At entry: acc[i] = a XOR prev (sum); new_carry = prev AND a.
+            b.cx(prev, acc[i]);     // acc[i] = a (restored)
+            let m = b.alloc_bit();
+            b.hmr(new_carry, m);     // new_carry → 0, phase += (prev AND a) · m
+            b.cz_if(prev, acc[i], m);// phase += prev · a · m. Cancels.
+            b.cx(prev, acc[i]);     // acc[i] = a XOR prev = sum
+        }
+        b.free(new_carry);
+    }
+
+    // Uncompute c0. Forward: ccx(ctrl, a, c0); cx(ctrl, acc[first]).
+    // Entry: acc[first] = a XOR ctrl (sum for set bit at first); c0 = ctrl AND a.
+    let c0 = carries.pop().unwrap();
+    b.cx(ctrl, acc[first]);     // acc[first] = a
+    let m = b.alloc_bit();
+    b.hmr(c0, m);                // c0 → 0, phase += (ctrl AND a) · m
+    b.cz_if(ctrl, acc[first], m);// phase += ctrl · a · m. Cancels.
+    b.cx(ctrl, acc[first]);     // acc[first] = a XOR ctrl = sum
+    b.free(c0);
+}
+
 fn add_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256) {
     let n = acc.len();
     let a = load_const(b, n, c);
@@ -879,7 +976,7 @@ fn mod_double_inplace_fast(b: &mut B, v: &[QubitId], p: U256) {
     // `ovf` and the low register holds T mod 2^n for T = 2*v. If ovf=1 then
     // T = 2^n + low and T mod p = low + c; otherwise T mod p = low.
     let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-    cadd_nbit_const_fast(b, v, c, ovf);
+    cadd_nbit_const_sparse_fast(b, v, c, ovf);
     // Result parity equals the old top bit: even if ovf=0, odd if ovf=1.
     b.cx(v[0], ovf);
     b.free(ovf);
