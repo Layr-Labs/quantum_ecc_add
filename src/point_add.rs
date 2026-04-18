@@ -2780,13 +2780,34 @@ fn kaliski_forward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iter
     b.x(st.f_flag);
 
     // ─── iter count iterations ───
-    for i in 0..iters {
+    // Paired wrapper: structural scaffold for future stride-2 optimizations
+    // (shared OR-chain / comparator / fused cswap). Currently 0-delta vs
+    // simple for-loop — future iterations replace the paired body with
+    // shared-computation primitives.
+    let mut i = 0usize;
+    while i + 1 < iters {
         kaliski_iteration(
             b, p, &st.u, &st.v_w, &st.r, &st.s,
             st.m_hist[i],
             st.f_flag, st.a_flag, st.b_flag, st.add_flag,
             i,
         );
+        kaliski_iteration(
+            b, p, &st.u, &st.v_w, &st.r, &st.s,
+            st.m_hist[i + 1],
+            st.f_flag, st.a_flag, st.b_flag, st.add_flag,
+            i + 1,
+        );
+        i += 2;
+    }
+    while i < iters {
+        kaliski_iteration(
+            b, p, &st.u, &st.v_w, &st.r, &st.s,
+            st.m_hist[i],
+            st.f_flag, st.a_flag, st.b_flag, st.add_flag,
+            i,
+        );
+        i += 1;
     }
 
     // After the loop for nonzero v_in, classical invariants give:
