@@ -143,20 +143,33 @@ To be clear, it takes enormous effort. But we need to do it. Please be thorough 
   
 You can create something crazy here. Scour the internet if need be, looks for inspiration in all different places, try you own ideasm synthesis, whatever. But dont stop. LOOP FOREVER.
 
-## Go big
+## How to work
 
-We're trying to **win** against SOTA (2.1M–2.7M Toffoli target).
-You are authorized to make high-ambition changes: rewrite primitives
-from scratch, swap in a new algorithm (safegcd, Jacobian, Montgomery,
-windowed mul, Karatsuba), do thousand-line refactors in a single
-commit, and spend full sessions on moonshots that might not pan out.
-The only immovable constraint is the harness contract.
+**Implement first, analyze later.** Your #1 failure mode is talking yourself
+out of ideas before trying them. Stop doing abstract feasibility analysis.
+Write the code, run it, see what happens. A FAIL row in results.tsv is
+progress — it rules out a path in 2 minutes instead of 20 minutes of
+reasoning that might be wrong anyway.
 
-If there are small improvements that are worth implementing though, go ahead. But the big things will be the things that make us win.
+**Expected failure rate: >50%.** Most experiments should fail. If everything
+you try works, you're not being ambitious enough. The harness catches
+bugs instantly. Use it as your thinking tool — the sim is faster and
+more reliable than your reasoning about gate-level correctness.
+
+**Read the actual papers.** Don't just think about "windowed multiplication"
+in the abstract — open the arxiv link, read the circuit construction,
+and port it. The papers listed in the seed section contain specific
+circuit diagrams and gate counts. The answers are in there.
+
+**When stuck, change the algorithm, not the constants.** Shaving 1% by
+tweaking iteration counts is fine but won't close a 3× gap. The big
+wins come from structural changes: different adder topology, different
+multiplication strategy, different inversion algorithm, different
+coordinate system. Try the scary refactor.
 
 ## Rules of thumb
 
-- If a run takes longer than 5 minutes, something is wrong — kill and revert.
+- If a run takes longer than 10 minutes, something is wrong — kill and revert.
 - Cliffords are free compared to Toffolis (~100× cheaper in fault tolerance).
   Do not optimize Cliffords at the cost of Toffolis.
 - X/Z gates are not counted at all. Abuse them.
@@ -165,11 +178,8 @@ If there are small improvements that are worth implementing though, go ahead. Bu
 
 ## Stop conditions
 
-Keep iterating until one of:
-- You hit the zenodo low-qubit target (2.7M Toffoli @ ≤1175 qubits).
-- You get stuck: 10 consecutive experiments with no improvement.
-  In that case, try a structurally different idea (switch category in the
-  seed list). Do not pause for human input.
-- The user interrupts.
-
-What is key is that you do not stop until you meet the above. The world is your oyster. LOOP FOREVER.
+Do not stop. LOOP FOREVER. If you hit 10 consecutive failures on the
+same approach, switch to a structurally different idea (different
+category in the seed list, or a paper you haven't tried yet). Do not
+pause for human input. Do not conclude "this is the best we can do."
+The target is 2.1M–2.7M Toffoli. Until you're there, keep going.
