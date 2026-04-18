@@ -3107,17 +3107,16 @@ fn with_kal_inv_raw_scratch<F: FnOnce(&mut B, &[QubitId], &[QubitId])>(
 
     kaliski_forward(b, v_in, &st, p, iters);
 
-    // The reduced-iteration Kaliski used here does not guarantee the full
-    // registers are (1, 0) on every shot, but the late-iteration width
-    // bounds do guarantee a zero tail on both u and v_w. Reuse only that
-    // provably-zero tail as scratch during the body.
-    let zero_tail_start = 2 * n - (iters - 1);
+    // After Kaliski forward with K ≥ empirical convergence floor, u = 1 and
+    // v_w = 0 on all shots. So u[1..n] and v_w[0..n] are all zero — usable as
+    // scratch. Keep u[0] = 1 reserved (needed for backward Kaliski's initial
+    // state). This expands scratch from ~2·(iters-n) to (n-1)+n ≈ 2n-1 qubits.
     let scratch: Vec<QubitId> = st
         .u
         .iter()
-        .skip(zero_tail_start)
+        .skip(1)
         .copied()
-        .chain(st.v_w.iter().skip(zero_tail_start).copied())
+        .chain(st.v_w.iter().copied())
         .collect();
     let r_low: Vec<QubitId> = st.r[..n].to_vec();
     body(b, &r_low, &scratch);
@@ -3229,8 +3228,8 @@ pub fn build() -> Vec<Op> {
     // quantum value (dx for pair 1, Rx-Ox for pair 2); their convergence
     // distributions may differ slightly. Boundaries verified empirically
     // against 9024 Fiat-Shamir shots.
-    const K1: usize = 2 * N - 116;  // pair 1 (invert dx)
-    const K2: usize = 2 * N - 115;  // pair 2 (invert Rx-Ox)
+    const K1: usize = 2 * N - 111;  // pair 1 (invert dx) - expanded-scratch floor
+    const K2: usize = 2 * N - 111;  // pair 2 (invert Rx-Ox) - expanded-scratch floor
 
     // Step 1-2: Px -= Qx, Py -= Qy
     mod_sub_qb(b, &tx, &ox, p);
