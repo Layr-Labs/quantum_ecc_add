@@ -2964,8 +2964,8 @@ pub fn build() -> Vec<Op> {
     // quantum value (dx for pair 1, Rx-Ox for pair 2); their convergence
     // distributions may differ slightly. Boundaries verified empirically
     // against 9024 Fiat-Shamir shots.
-    const K1: usize = 2 * N - 114;  // pair 1 (invert dx)
-    const K2: usize = 2 * N - 114;  // pair 2 (invert Rx-Ox)
+    const K1: usize = 2 * N - 115;  // pair 1 (invert dx)
+    const K2: usize = 2 * N - 115;  // pair 2 (invert Rx-Ox)
 
     // Step 1-2: Px -= Qx, Py -= Qy
     mod_sub_qb(b, &tx, &ox, p);
