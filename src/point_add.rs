@@ -2208,11 +2208,14 @@ fn kaliski_iteration(
     // ─── STEP 0: is_zero = (v_w == 0);  m[i] ^= (f AND is_zero);  f ^= m[i] ───
     // Truncated OR chain for late iter: v_w's bits [2n-iter..n-1] are 0
     // (Kaliski invariant), so OR only of low 2n-iter bits suffices.
-    let or_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-    with_eq_zero_fast(b, &v_w[0..or_width], add_f, |b| {
-        b.ccx(f, add_f, m_i);
-    });
-    b.cx(m_i, f);
+    const STEP0_SKIP: usize = 1;
+    if iter_idx >= STEP0_SKIP {
+        let or_width = if iter_idx < n { n } else { 2 * n - iter_idx };
+        with_eq_zero_fast(b, &v_w[0..or_width], add_f, |b| {
+            b.ccx(f, add_f, m_i);
+        });
+        b.cx(m_i, f);
+    }
 
     // ─── STEP 1 ───
     //   a ^= (f=1 AND u[0]=0)
@@ -2743,8 +2746,9 @@ fn kaliski_iteration_backward(
 
     // ── Reverse STEP 0 (with measurement uncompute of OR chain) ────────
     // Truncated for late iter: only low 2n-iter bits of v_w are possibly nonzero.
-    b.cx(m_i, f);
-    {
+    const STEP0_SKIP_BW: usize = 1;
+    if iter_idx >= STEP0_SKIP_BW {
+        b.cx(m_i, f);
         let or_width = if iter_idx < n { n } else { 2 * n - iter_idx };
         let nv = or_width;
         if nv == 1 {
