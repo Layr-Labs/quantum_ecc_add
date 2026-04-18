@@ -1634,6 +1634,121 @@ fn karatsuba_inverse(
     }
 }
 
+/// 2-level Karatsuba forward. Uses 1-level Karatsuba for A and B sub-muls.
+fn karatsuba_forward_2level(
+    b: &mut B,
+    x: &[QubitId],
+    y: &[QubitId],
+    tmp_ext: &[QubitId],
+    z1_reg: &[QubitId],
+    z1_inner_a: &[QubitId],
+    z1_inner_b: &[QubitId],
+) {
+    let n = x.len();
+    let h = n / 2;
+    let x_lo: Vec<QubitId> = x[0..h].to_vec();
+    let x_hi: Vec<QubitId> = x[h..n].to_vec();
+    let y_lo: Vec<QubitId> = y[0..h].to_vec();
+    let y_hi: Vec<QubitId> = y[h..n].to_vec();
+
+    {
+        let slice: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
+        karatsuba_forward(b, &x_lo, &y_lo, &slice, z1_inner_a);
+    }
+    {
+        let slice: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
+        karatsuba_forward(b, &x_hi, &y_hi, &slice, z1_inner_b);
+    }
+    let z_sum = b.alloc_qubits(h + 1);
+    let y_sum = b.alloc_qubits(h + 1);
+    karatsuba_half_sum_compute(b, &x_lo, &x_hi, &z_sum);
+    karatsuba_half_sum_compute(b, &y_lo, &y_hi, &y_sum);
+    schoolbook_mul_into(b, &z_sum, &y_sum, z1_reg);
+    karatsuba_half_sum_uncompute(b, &y_lo, &y_hi, &y_sum);
+    karatsuba_half_sum_uncompute(b, &x_lo, &x_hi, &z_sum);
+    b.free_vec(&y_sum);
+    b.free_vec(&z_sum);
+    {
+        let pad = b.alloc_qubits(2);
+        let mut z0_ext: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
+        z0_ext.extend_from_slice(&pad);
+        sub_nbit_qq_fast(b, &z0_ext, z1_reg);
+        b.free_vec(&pad);
+    }
+    {
+        let pad = b.alloc_qubits(2);
+        let mut z2_ext: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
+        z2_ext.extend_from_slice(&pad);
+        sub_nbit_qq_fast(b, &z2_ext, z1_reg);
+        b.free_vec(&pad);
+    }
+    {
+        let pad = b.alloc_qubits(3*h - 2*(h+1));
+        let mut z1_ext: Vec<QubitId> = z1_reg.to_vec();
+        z1_ext.extend_from_slice(&pad);
+        let acc_slice: Vec<QubitId> = tmp_ext[h..4*h].to_vec();
+        add_nbit_qq_fast(b, &z1_ext, &acc_slice);
+        b.free_vec(&pad);
+    }
+}
+
+fn karatsuba_inverse_2level(
+    b: &mut B,
+    x: &[QubitId],
+    y: &[QubitId],
+    tmp_ext: &[QubitId],
+    z1_reg: &[QubitId],
+    z1_inner_a: &[QubitId],
+    z1_inner_b: &[QubitId],
+) {
+    let n = x.len();
+    let h = n / 2;
+    let x_lo: Vec<QubitId> = x[0..h].to_vec();
+    let x_hi: Vec<QubitId> = x[h..n].to_vec();
+    let y_lo: Vec<QubitId> = y[0..h].to_vec();
+    let y_hi: Vec<QubitId> = y[h..n].to_vec();
+
+    {
+        let pad = b.alloc_qubits(3*h - 2*(h+1));
+        let mut z1_ext: Vec<QubitId> = z1_reg.to_vec();
+        z1_ext.extend_from_slice(&pad);
+        let acc_slice: Vec<QubitId> = tmp_ext[h..4*h].to_vec();
+        sub_nbit_qq_fast(b, &z1_ext, &acc_slice);
+        b.free_vec(&pad);
+    }
+    {
+        let pad = b.alloc_qubits(2);
+        let mut z2_ext: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
+        z2_ext.extend_from_slice(&pad);
+        add_nbit_qq_fast(b, &z2_ext, z1_reg);
+        b.free_vec(&pad);
+    }
+    {
+        let pad = b.alloc_qubits(2);
+        let mut z0_ext: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
+        z0_ext.extend_from_slice(&pad);
+        add_nbit_qq_fast(b, &z0_ext, z1_reg);
+        b.free_vec(&pad);
+    }
+    let z_sum = b.alloc_qubits(h + 1);
+    let y_sum = b.alloc_qubits(h + 1);
+    karatsuba_half_sum_compute(b, &x_lo, &x_hi, &z_sum);
+    karatsuba_half_sum_compute(b, &y_lo, &y_hi, &y_sum);
+    schoolbook_mul_into_inverse(b, &z_sum, &y_sum, z1_reg);
+    karatsuba_half_sum_uncompute(b, &y_lo, &y_hi, &y_sum);
+    karatsuba_half_sum_uncompute(b, &x_lo, &x_hi, &z_sum);
+    b.free_vec(&y_sum);
+    b.free_vec(&z_sum);
+    {
+        let slice: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
+        karatsuba_inverse(b, &x_hi, &y_hi, &slice, z1_inner_b);
+    }
+    {
+        let slice: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
+        karatsuba_inverse(b, &x_lo, &y_lo, &slice, z1_inner_a);
+    }
+}
+
 /// mod_mul_add variant using Karatsuba. Equivalent to
 /// mod_mul_add_into_acc_schoolbook_with_tmp_ext but with Karatsuba internals.
 fn mod_mul_add_into_acc_karatsuba_with_tmp_ext(
@@ -1648,10 +1763,13 @@ fn mod_mul_add_into_acc_karatsuba_with_tmp_ext(
     debug_assert_eq!(n, 256);
     debug_assert_eq!(tmp_ext.len(), 2 * n);
     let h = n / 2;
+    let h2 = h / 2;
 
     // z1_reg persists across Solinas reduction (= middle cross-product).
     let z1_reg = b.alloc_qubits(2 * (h + 1));
-    karatsuba_forward(b, x, y, tmp_ext, &z1_reg);
+    let z1_inner_a = b.alloc_qubits(2 * (h2 + 1));
+    let z1_inner_b = b.alloc_qubits(2 * (h2 + 1));
+    karatsuba_forward_2level(b, x, y, tmp_ext, &z1_reg, &z1_inner_a, &z1_inner_b);
 
     let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
     let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
@@ -1670,7 +1788,9 @@ fn mod_mul_add_into_acc_karatsuba_with_tmp_ext(
         mod_halve_inplace_fast(b, &hi, p);
     }
 
-    karatsuba_inverse(b, x, y, tmp_ext, &z1_reg);
+    karatsuba_inverse_2level(b, x, y, tmp_ext, &z1_reg, &z1_inner_a, &z1_inner_b);
+    b.free_vec(&z1_inner_b);
+    b.free_vec(&z1_inner_a);
     b.free_vec(&z1_reg);
 }
 
@@ -1687,9 +1807,12 @@ fn mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(
     debug_assert_eq!(n, 256);
     debug_assert_eq!(tmp_ext.len(), 2 * n);
     let h = n / 2;
+    let h2 = h / 2;
 
     let z1_reg = b.alloc_qubits(2 * (h + 1));
-    karatsuba_forward(b, x, y, tmp_ext, &z1_reg);
+    let z1_inner_a = b.alloc_qubits(2 * (h2 + 1));
+    let z1_inner_b = b.alloc_qubits(2 * (h2 + 1));
+    karatsuba_forward_2level(b, x, y, tmp_ext, &z1_reg, &z1_inner_a, &z1_inner_b);
 
     let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
     let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
@@ -1708,7 +1831,9 @@ fn mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(
         mod_halve_inplace_fast(b, &hi, p);
     }
 
-    karatsuba_inverse(b, x, y, tmp_ext, &z1_reg);
+    karatsuba_inverse_2level(b, x, y, tmp_ext, &z1_reg, &z1_inner_a, &z1_inner_b);
+    b.free_vec(&z1_inner_b);
+    b.free_vec(&z1_inner_a);
     b.free_vec(&z1_reg);
 }
 
@@ -3229,8 +3354,8 @@ pub fn build() -> Vec<Op> {
     // quantum value (dx for pair 1, Rx-Ox for pair 2); their convergence
     // distributions may differ slightly. Boundaries verified empirically
     // against 9024 Fiat-Shamir shots.
-    const K1: usize = 2 * N - 116;  // pair 1 (invert dx)
-    const K2: usize = 2 * N - 115;  // pair 2 (invert Rx-Ox)
+    const K1: usize = 2 * N - 114;  // pair 1 (invert dx) - tuned for 2-level seed
+    const K2: usize = 2 * N - 114;  // pair 2 (invert Rx-Ox) - tuned for 2-level seed
 
     // Step 1-2: Px -= Qx, Py -= Qy
     mod_sub_qb(b, &tx, &ox, p);
