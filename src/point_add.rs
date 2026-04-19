@@ -2618,25 +2618,23 @@ fn kaliski_iteration(
     let l_gt = b.alloc_qubit();
     if iter_idx == 0 {
         b.x(l_gt);  // l_gt = 1 (since p > v_in always)
-        // Body (same as with_gt body). Iter 0 has f=1, l_gt=1 both constant
-        // so ccx(f,l_gt,add_f) simplifies to x(add_f), and phase correction
-        // z_if(l_gt=1, am) = neg_if(am) (applied unconditionally on zm=1).
         b.x(b_f);
         b.x(add_f);                       // add_f = 1 (= f·l_gt under both=1)
         let t = b.alloc_qubit();
-        b.ccx(add_f, b_f, t);
+        // add_f = 1 classical: ccx(add_f=1, b_f, t) simplifies to cx(b_f, t).
+        b.cx(b_f, t);
         b.cx(t, a_f);
         b.cx(t, m_i);
         {
             let tm = b.alloc_bit();
             b.hmr(t, tm);
-            b.cz_if(add_f, b_f, tm);
+            b.z_if(b_f, tm);              // phase correct for cx(b_f, t) under add_f=1
         }
         b.free(t);
         {
             let am = b.alloc_bit();
             b.hmr(add_f, am);
-            b.neg_if(am);                 // phase correct for x(add_f): z·z = 1, so any qubit phase on |1⟩ is just neg_if
+            b.neg_if(am);
         }
         b.x(b_f);
         b.x(l_gt);  // l_gt = 0
@@ -3507,7 +3505,7 @@ pub fn build() -> Vec<Op> {
     // distributions may differ slightly. Boundaries verified empirically
     // against 9024 Fiat-Shamir shots.
     const K1: usize = 2 * N - 112;  // pair 1 (invert dx) - new floor post op-stream shift
-    const K2: usize = 2 * N - 111;  // pair 2 (invert Rx-Ox) - expanded-scratch floor
+    const K2: usize = 2 * N - 111;  // pair 2 (invert Rx-Ox)
     // Per-pair STEP0_SKIP: maximum iter count below convergence for each pair.
     const STEP0_SKIP_1: usize = 241;
     const STEP0_SKIP_2: usize = 301;
