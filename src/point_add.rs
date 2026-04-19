@@ -4065,8 +4065,8 @@ pub fn build() -> Vec<Op> {
     // quantum value (dx for pair 1, Rx-Ox for pair 2); their convergence
     // distributions may differ slightly. Boundaries verified empirically
     // against 9024 Fiat-Shamir shots.
-    const K1: usize = 2 * N - 1;    // HRSL WIP: safety max while debugging termination
-    const K2: usize = 2 * N - 111;  // pair 2 unchanged
+    const K1: usize = 2 * N - 112;  // pair 1 baseline
+    const K2: usize = 2 * N - 111;  // pair 2
     // Per-pair STEP0_SKIP: maximum iter count below convergence for each pair.
     const STEP0_SKIP_1: usize = 241;
     const STEP0_SKIP_2: usize = 301;
@@ -4077,9 +4077,8 @@ pub fn build() -> Vec<Op> {
 
     let lam = b.alloc_qubits(N);
 
-    // Pair 1: HRSL wired with WIP termination.
-    let _ = STEP0_SKIP_1;
-    with_kal_inv_hrsl(b, &tx, p, K1, |b, inv_raw, scratch| {
+    // Pair 1: baseline Kaliski (HRSL infra tested but broken for heterogeneous inputs).
+    with_kal_inv_raw_scratch(b, &tx, p, K1, STEP0_SKIP_1, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
         tmp_ext.extend_from_slice(scratch);

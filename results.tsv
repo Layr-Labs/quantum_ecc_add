@@ -537,3 +537,4 @@ timestamp	commit	toffoli	clifford	qubits	ops	correct	notes
 1776596755	6d67afa	40280.816	213752.427	3107	39548011	FAIL	HRSL wired but post-convergence bug — expected FAIL | PHASE GARBAGE: global_phase = 0xa79bdd08dce27898 across 64 live shots (must be 0)
 1776597690	bcc7e3d	42194.348	218401.933	3107	43211883	FAIL	HRSL with full f-gating termination | PHASE GARBAGE: global_phase = 0x0100008160902101 across 64 live shots (must be 0)
 1776598259	59dec5d	42194.348	218401.933	3107	43211883	FAIL	HRSL full build with all unit test fixes | PHASE GARBAGE: global_phase = 0x0100008160902101 across 64 live shots (must be 0)
+1776598720	8c7839d	4351164.000	22315498.998	2997	29798803	OK	revert HRSL wiring, restore baseline
