@@ -4147,7 +4147,7 @@ mod tests {
         let p = U256::from_str_radix(
             "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
         ).unwrap();
-        let iters = 260;
+        let iters = 259;
         let n = 256;
 
         let b = &mut B::new();
