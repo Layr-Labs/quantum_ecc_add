@@ -2930,6 +2930,56 @@ fn mulmod(a: U256, b: U256, p: U256) -> U256 {
 /// a plain shift (0 Toffoli) for ~255 CCX savings per iter.
 const R_SMALL_THRESHOLD: usize = 328;
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  Montgomery batched inversion scaffold (multi-session build-up)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Algebraic identity for secp256k1 point-add:
+//   let dx = Px - Qx, dy = Py - Qy (quantum)
+//   λ = dy / dx
+//   Rx = λ² - Px - Qx
+//   Rx - Qx = dy² / dx² - Px - 2·Qx = N / dx²
+//   where N = dy² - (Px + 2·Qx) · dx²  (all mod p)
+//
+// So (Rx - Qx)^-1 = dx² / N.
+// Batched: invert c = dx · N once; then
+//   dx^-1 = c^-1 · N
+//   (Rx - Qx)^-1 = c^-1 · dx · dx² = c^-1 · dx³
+// Potential win: 1 Kaliski pair instead of 2 = ~2M Toffoli gross.
+// Cost: ~6 extra quantum muls + uncomputes.
+
+/// Classical modular add.
+#[allow(dead_code)]
+fn addmod(a: U256, b: U256, p: U256) -> U256 {
+    let a = a % p;
+    let b = b % p;
+    let sum = a.wrapping_add(b);
+    // Detect wraparound OR sum >= p
+    if sum < a || sum >= p {
+        sum.wrapping_sub(p)
+    } else {
+        sum
+    }
+}
+
+/// Classical modular sub.
+#[allow(dead_code)]
+fn submod(a: U256, b: U256, p: U256) -> U256 {
+    let a = a % p;
+    let b = b % p;
+    if a >= b { a.wrapping_sub(b) } else { p.wrapping_sub(b.wrapping_sub(a)) }
+}
+
+/// Classical: compute N = dy² - (Px + 2·Qx) · dx² mod p.
+#[allow(dead_code)]
+fn classical_montgomery_n(dx: U256, dy: U256, px: U256, qx: U256, p: U256) -> U256 {
+    let dx2 = mulmod(dx, dx, p);
+    let dy2 = mulmod(dy, dy, p);
+    let px_plus_2qx = addmod(px, addmod(qx, qx, p), p);
+    let offset = mulmod(px_plus_2qx, dx2, p);
+    submod(dy2, offset, p)
+}
+
 fn kaliski_iteration(
     b: &mut B,
     p: U256,
@@ -4356,6 +4406,45 @@ mod tests {
         let mut h = Shake256::default();
         Update::update(&mut h, b"test-qrom");
         h.finalize_xof()
+    }
+
+    /// Verify Montgomery identity: (Rx - Qx) · dx² = N classically.
+    /// If this holds, then (Rx - Qx)^-1 = dx² / N and we can batch inversions.
+    #[test]
+    fn test_montgomery_identity_classical() {
+        use sha3::digest::XofReader;
+        let p = SECP256K1_P;
+        let curve = crate::weierstrass_elliptic_curve::WeierstrassEllipticCurve {
+            modulus: p,
+            a: U256::from(0),
+            b: U256::from(7),
+            gx: U256::from_str_radix("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16).unwrap(),
+            gy: U256::from_str_radix("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16).unwrap(),
+            order: U256::from_str_radix("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16).unwrap(),
+        };
+        let mut xof = make_xof();
+        for trial in 0..10 {
+            let mut rb = [0u8; 32];
+            xof.read(&mut rb);
+            let k1 = U256::from_le_bytes(rb);
+            xof.read(&mut rb);
+            let k2 = U256::from_le_bytes(rb);
+            let (px, py) = curve.mul(curve.gx, curve.gy, k1);
+            let (qx, qy) = curve.mul(curve.gx, curve.gy, k2);
+            if px == qx { continue; }
+            let (rx, _ry) = curve.add(px, py, qx, qy);
+
+            // dx = Px - Qx mod p
+            let dx = if px >= qx { px.wrapping_sub(qx) % p } else { p.wrapping_sub(qx.wrapping_sub(px)) % p };
+            let dy = if py >= qy { py.wrapping_sub(qy) % p } else { p.wrapping_sub(qy.wrapping_sub(py)) % p };
+            let n = classical_montgomery_n(dx, dy, px, qx, p);
+
+            // Check: (Rx - Qx) · dx² == N mod p
+            let rx_minus_qx = if rx >= qx { rx.wrapping_sub(qx) % p } else { p.wrapping_sub(qx.wrapping_sub(rx)) % p };
+            let dx2 = mulmod(dx, dx, p);
+            let lhs = mulmod(rx_minus_qx, dx2, p);
+            assert_eq!(lhs, n, "trial {} identity failed: (Rx-Qx)·dx²=0x{:x} N=0x{:x}", trial, lhs, n);
+        }
     }
 
     #[test]
