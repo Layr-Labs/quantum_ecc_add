@@ -4256,6 +4256,78 @@ mod tests {
         eprintln!("phase = 0x{:x}", phase);
     }
 
+    /// Run HRSL+body using the EXACT (dx, dy) from build()'s failing shot 9023.
+    #[test]
+    fn test_hrsl_failing_shot() {
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 511;
+        let n = 256;
+
+        // From build() failing shot 9023:
+        let t_x = U256::from_str_radix(
+            "b781f26546ae640154b64cc3c12513c62cb27766f67bb5420ddd57d4662d0b9d", 16).unwrap();
+        let t_y = U256::from_str_radix(
+            "879de85360dfa108090a9568043cf870df3dd1fdd8d2587e837a8897f2701e27", 16).unwrap();
+        let o_x = U256::from_str_radix(
+            "e9ef9bbd86ee6e87347843c8ba89b6262eb65c92de30b6d247df463bb3383e23", 16).unwrap();
+        let o_y = U256::from_str_radix(
+            "97358d7957c91b03a05f41cc98166d16fdd63abbbc3e6cf8eadeec13f551c75a", 16).unwrap();
+
+        // dx = (t_x - o_x) mod p
+        let dx = t_x.wrapping_sub(o_x) % p;
+        let dy = t_y.wrapping_sub(o_y) % p;
+        eprintln!("dx=0x{:x}  dy=0x{:x}", dx, dy);
+
+        let b = &mut B::new();
+        let v_in = b.alloc_qubits(n);
+        let ty = b.alloc_qubits(n);
+        let lam = b.alloc_qubits(n);
+
+        with_kal_inv_hrsl(b, &v_in, p, iters, |b, inv_raw, scratch| {
+            let tmp_lo = b.alloc_qubits(2 * n - scratch.len());
+            let mut tmp_ext = tmp_lo.clone();
+            tmp_ext.extend_from_slice(scratch);
+            mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &lam, &ty, inv_raw, p, &tmp_ext);
+            for _ in 0..iters { mod_halve_inplace_fast(b, &lam, p); }
+            mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &v_in, p, &tmp_ext);
+            b.free_vec(&tmp_lo);
+        });
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+        for j in 0..n {
+            if dx.bit(j) { for shot in 0..64 { *sim.qubit_mut(v_in[j]) |= 1u64 << shot; } }
+            if dy.bit(j) { for shot in 0..64 { *sim.qubit_mut(ty[j]) |= 1u64 << shot; } }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let mut ty_final = U256::ZERO;
+        let mut lam_final = U256::ZERO;
+        for j in 0..n {
+            if (sim.qubit(ty[j]) >> 0) & 1 == 1 { ty_final |= U256::from(1) << j; }
+            if (sim.qubit(lam[j]) >> 0) & 1 == 1 { lam_final |= U256::from(1) << j; }
+        }
+        let dx_inv = classical_modinv(dx, p);
+        let lambda = mulmod(dy, dx_inv, p);
+        let neg_lambda = p.wrapping_sub(lambda);
+        eprintln!("ty_final=0x{:x}  lam_final=0x{:x}  expected_neg_lam=0x{:x}",
+            ty_final, lam_final, neg_lambda);
+        let phase = sim.global_phase();
+        eprintln!("phase=0x{:x}", phase);
+
+        let mut dirty = 0;
+        for q in (3*n as u32)..num_qubits {
+            if sim.qubit(QubitId(q)) != 0 { dirty += 1; }
+        }
+        eprintln!("dirty(scratch)={}", dirty);
+    }
+
     /// Reproduce build() pair 1 body inside HRSL wrapper: mul + halve + mul.
     /// This should expose the bug currently only visible in full build().
     #[test]
