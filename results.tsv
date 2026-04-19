@@ -535,3 +535,4 @@ timestamp	commit	toffoli	clifford	qubits	ops	correct	notes
 1776595221	7676281	40280.816	213753.377	3107	39548522	FAIL	HRSL: STEP 16 via HMR+cz_if(r[0]) | PHASE GARBAGE: global_phase = 0x534d061c7a4b829d across 64 live shots (must be 0)
 1776595383	61a89e6	40280.816	213749.571	3107	39547500	FAIL	HRSL: drop STEP 16 to expose a_q dirty state | PHASE GARBAGE: global_phase = 0x08c8168bb6bc2464 across 64 live shots (must be 0)
 1776596755	6d67afa	40280.816	213752.427	3107	39548011	FAIL	HRSL wired but post-convergence bug — expected FAIL | PHASE GARBAGE: global_phase = 0xa79bdd08dce27898 across 64 live shots (must be 0)
+1776597690	bcc7e3d	42194.348	218401.933	3107	43211883	FAIL	HRSL with full f-gating termination | PHASE GARBAGE: global_phase = 0x0100008160902101 across 64 live shots (must be 0)

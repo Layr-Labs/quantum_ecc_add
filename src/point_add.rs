@@ -3334,8 +3334,8 @@ fn kaliski_iteration_hrsl(
     // STEP 15: cswap back (r, s)
     for i in 0..n { cswap(b, a_q, r[i], s[i]); }
 
-    // STEP 16: uncompute a_q via r[0] parity (MS invariant: a_q == r[0] at this point).
-    b.cx(r[0], a_q);
+    // STEP 16: uncompute a_q via r[0] parity (gated on f — post-conv a_q=0 already).
+    b.ccx(f_flag, r[0], a_q);
 
     b.free(b_q);
     b.free(a_q);
@@ -3366,8 +3366,8 @@ fn kaliski_iteration_hrsl_backward(
     let a_q = b.alloc_qubit();
     let b_q = b.alloc_qubit();
 
-    // Reverse STEP 16: a_q = r[0] (pre-uncompute state)
-    b.cx(r[0], a_q);
+    // Reverse STEP 16: a_q = f AND r[0] (pre-uncompute state)
+    b.ccx(f_flag, r[0], a_q);
 
     // Reverse STEP 15, 14: cswap back
     for i in 0..n { cswap(b, a_q, r[i], s[i]); }
@@ -4136,7 +4136,7 @@ mod tests {
         let p = U256::from_str_radix(
             "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
         ).unwrap();
-        let iters = 260;  // enough to converge for small v
+        let iters = 511;  // safety max
         let n = 256;
 
         let b = &mut B::new();
@@ -4192,7 +4192,7 @@ mod tests {
         let p = U256::from_str_radix(
             "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
         ).unwrap();
-        let iters = 300;
+        let iters = 511;
         let n = 256;
 
         let b = &mut B::new();
