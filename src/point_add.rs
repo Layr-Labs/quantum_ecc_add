@@ -4255,6 +4255,66 @@ mod tests {
         eprintln!("phase = 0x{:x}", phase);
     }
 
+    /// Per-shot asymmetric: shot 0 converges fast, shot 1 slower.
+    /// Check which specific qubits differ between forward-state-at-iter-i and
+    /// backward-would-see-iter-i.
+    #[test]
+    fn test_hrsl_small_diagnose() {
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 30;
+        let n = 256;
+
+        // Run forward only
+        let b = &mut B::new();
+        let v_in = b.alloc_qubits(n);
+        let st = alloc_kaliski_state(b, n, iters);
+        kaliski_forward_hrsl(b, &v_in, &st, p, iters);
+        let ops_fwd = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        let mut xof1 = make_xof();
+        let mut sim_fwd = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof1);
+        sim_fwd.clear_for_shot();
+        for shot in 0..64usize {
+            let dx = U256::from(shot as u64 + 3);
+            for j in 0..n {
+                if dx.bit(j) { *sim_fwd.qubit_mut(v_in[j]) |= 1u64 << shot; }
+            }
+        }
+        sim_fwd.apply_iter(ops_fwd.into_iter());
+
+        // Now run forward + backward
+        let b2 = &mut B::new();
+        let v_in2 = b2.alloc_qubits(n);
+        let st2 = alloc_kaliski_state(b2, n, iters);
+        kaliski_forward_hrsl(b2, &v_in2, &st2, p, iters);
+        kaliski_backward_hrsl(b2, &v_in2, &st2, p, iters);
+        let ops_fb = b2.ops.clone();
+        let nq2 = b2.next_qubit;
+        let nb2 = b2.next_bit;
+
+        let mut xof2 = make_xof();
+        let mut sim_fb = Simulator::new(nq2 as usize, nb2 as usize, &mut xof2);
+        sim_fb.clear_for_shot();
+        for shot in 0..64usize {
+            let dx = U256::from(shot as u64 + 3);
+            for j in 0..n {
+                if dx.bit(j) { *sim_fb.qubit_mut(v_in2[j]) |= 1u64 << shot; }
+            }
+        }
+        sim_fb.apply_iter(ops_fb.into_iter());
+
+        let phase = sim_fb.global_phase();
+        let mut dirty = 0;
+        for q in (n as u32)..nq2 {
+            if sim_fb.qubit(QubitId(q)) != 0 { dirty += 1; }
+        }
+        eprintln!("iters={} varied: dirty={} phase=0x{:x}", iters, dirty, phase);
+    }
+
     /// Varied inputs per shot, forward+backward only (no body).
     #[test]
     fn test_hrsl_varied_shots_no_body() {
