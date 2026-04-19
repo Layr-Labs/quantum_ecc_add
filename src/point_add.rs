@@ -4227,6 +4227,52 @@ mod tests {
     }
 
     #[test]
+    fn test_csub_sparse_n256_random() {
+        use sha3::digest::XofReader;
+        let c_val = U256::from(1u64 << 32) | U256::from(977u64);
+        let n = 256usize;
+        let mut xof = make_xof();
+        for trial in 0..200 {
+            let mut bytes = [0u8; 32];
+            xof.read(&mut bytes);
+            let acc_u = U256::from_le_bytes(bytes);
+            let ctrl_val = (bytes[0] & 1) as u64;
+            let expected = if ctrl_val == 1 { acc_u.wrapping_sub(c_val) } else { acc_u };
+
+            let bb = &mut B::new();
+            let acc = bb.alloc_qubits(n);
+            let ctrl = bb.alloc_qubit();
+            csub_nbit_const_sparse_fast(bb, &acc, c_val, ctrl);
+            let ops = bb.ops.clone();
+            let nq = bb.next_qubit;
+            let nb = bb.next_bit;
+
+            let mut xof2 = make_xof();
+            let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof2);
+            sim.clear_for_shot();
+            for j in 0..n {
+                if acc_u.bit(j) { *sim.qubit_mut(acc[j]) |= 1u64; }
+            }
+            if ctrl_val == 1 { *sim.qubit_mut(ctrl) |= 1u64; }
+            sim.apply_iter(ops.into_iter());
+
+            let mut got = U256::ZERO;
+            for j in 0..n {
+                if (sim.qubit(acc[j]) >> 0) & 1 == 1 {
+                    got |= U256::from(1) << j;
+                }
+            }
+            assert_eq!(got, expected, "trial {}: acc=0x{:x} ctrl={} got=0x{:x} exp=0x{:x}",
+                trial, acc_u, ctrl_val, got, expected);
+            for q in (n as u32 + 1)..nq {
+                let v = sim.qubit(QubitId(q));
+                assert_eq!(v, 0, "trial {} dirty qubit {}: 0x{:x}", trial, q, v);
+            }
+            assert_eq!(sim.global_phase(), 0, "trial {} phase nonzero", trial);
+        }
+    }
+
+    #[test]
     fn test_csub_sparse_n256_highbit() {
         // Test with acc having bit 100 and bit 200 set, ctrl=1, c=2^32+977.
         let c_val = U256::from(1u64 << 32) | U256::from(977u64);
