@@ -3458,7 +3458,7 @@ fn kaliski_iteration_hrsl_backward(
     b.ccx(f_flag, u[0], a_q);
     b.x(u[0]);
 
-    // Reverse STEP 0: undo termination flag update
+    // Reverse STEP 0: undo termination flag update.
     {
         let zero_flag = b.alloc_qubit();
         b.cx(m_hist, f_flag);
