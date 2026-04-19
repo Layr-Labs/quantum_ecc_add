@@ -2659,7 +2659,10 @@ fn kaliski_iteration(
     // so u[j]=v_w[j]=0 for j >= 2n-iter_idx. Truncate (u,v_w) cswap.
     // Small-iter truncation: max(r,s) ≤ 2^iter_idx, so r[j]=s[j]=0 for j >= iter_idx+1.
     let uv_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-    for j in 0..uv_width { cswap(b, a_f, u[j], v_w[j]); }
+    // Iter 0 j=0: cswap(a_f=v_w[0], u[0]=1, v_w[0]) is classically no-op
+    // (u[0] ends at 1, v_w[0] unchanged regardless of v_w[0] value). Skip.
+    let j_start = if iter_idx == 0 { 1 } else { 0 };
+    for j in j_start..uv_width { cswap(b, a_f, u[j], v_w[j]); }
     let rs_width_step3 = if iter_idx + 1 < n { iter_idx + 1 } else { n };
     for j in 0..rs_width_step3 { cswap(b, a_f, r[j], s[j]); }
 
@@ -3110,7 +3113,9 @@ fn kaliski_iteration_backward(
     let rs_width_step3 = if iter_idx + 1 < n { iter_idx + 1 } else { n };
     let uv_width = if iter_idx < n { n } else { 2 * n - iter_idx };
     for j in (0..rs_width_step3).rev() { cswap(b, a_f, r[j], s[j]); }
-    for j in (0..uv_width).rev() { cswap(b, a_f, u[j], v_w[j]); }
+    // Iter 0 j=0: cswap is classically no-op (mirror of forward). Skip.
+    let j_start = if iter_idx == 0 { 1 } else { 0 };
+    for j in (j_start..uv_width).rev() { cswap(b, a_f, u[j], v_w[j]); }
 
     // ── Reverse STEP 2 (with_gt body is self-inverse) ──────────────────
     // Iter 0: after reverse-STEP-3 (un-swap), u=p and v_w=v_in; l_gt=1 always.
