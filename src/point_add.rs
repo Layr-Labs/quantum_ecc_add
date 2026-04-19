@@ -4261,7 +4261,7 @@ mod tests {
         let p = U256::from_str_radix(
             "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
         ).unwrap();
-        let iters = 300;
+        let iters = 511;
         let n = 256;
 
         let b = &mut B::new();
@@ -4285,12 +4285,27 @@ mod tests {
         sim.apply_iter(ops.into_iter());
 
         let phase = sim.global_phase();
-        eprintln!("varied roundtrip: phase=0x{:x}", phase);
-        let mut dirty = 0;
+        eprintln!("varied roundtrip iters={}: phase=0x{:x}", iters, phase);
+        // Print dirty qubits by register position.
+        let u_start = n as u32;
+        let v_start = u_start + n as u32;
+        let r_start = v_start + n as u32;
+        let s_start = r_start + n as u32;
+        let m_start = s_start + n as u32;
+        let mut counts = [0usize; 6]; // u, v, r, s, m_hist, flags+other
         for q in (n as u32)..num_qubits {
-            if sim.qubit(QubitId(q)) != 0 { dirty += 1; }
+            let val = sim.qubit(QubitId(q));
+            if val != 0 {
+                if q < v_start { counts[0] += 1; }
+                else if q < r_start { counts[1] += 1; }
+                else if q < s_start { counts[2] += 1; }
+                else if q < m_start { counts[3] += 1; }
+                else if q < m_start + iters as u32 { counts[4] += 1; }
+                else { counts[5] += 1; }
+            }
         }
-        eprintln!("  dirty={}", dirty);
+        eprintln!("  dirty by register: u={} v_w={} r={} s={} m_hist={} flags/other={}",
+            counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]);
     }
 
     /// Varied inputs per shot — closer to build()'s actual stress.
