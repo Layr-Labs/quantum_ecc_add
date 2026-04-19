@@ -1073,7 +1073,7 @@ fn mod_shift_right_by_k(b: &mut B, v: &[QubitId], p: U256, k: usize, spill: Vec<
     b.x(flag_inv);
     b.cx(flag_inv, ovf);
     b.x(flag_inv);
-    cadd_nbit_const_fast(b, &v_ext, c, flag_inv);
+    cadd_nbit_const_sparse_fast(b, &v_ext, c, flag_inv);
 
     // Reverse step 3.
     b.x(ovf);
