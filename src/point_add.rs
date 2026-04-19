@@ -2078,6 +2078,47 @@ fn mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(
     b.free_vec(&z1_reg);
 }
 
+/// Inverse of mod_mul_write_into_zero_acc_karatsuba: acc holds x·y, end at 0.
+/// Uncomputes via Karatsuba forward + Solinas SUB (flipping signs) + inverse.
+#[allow(dead_code)]
+fn mod_mul_sub_from_acc_karatsuba_with_tmp_ext(
+    b: &mut B,
+    acc: &[QubitId],
+    x: &[QubitId],
+    y: &[QubitId],
+    p: U256,
+    tmp_ext: &[QubitId],
+) {
+    let n = acc.len();
+    debug_assert_eq!(n, 256);
+    debug_assert_eq!(tmp_ext.len(), 2 * n);
+    let h = n / 2;
+
+    let z1_reg = b.alloc_qubits(2 * (h + 1));
+    karatsuba_forward(b, x, y, tmp_ext, &z1_reg);
+
+    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
+    let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
+    // Subtract lo+hi·c from acc (reverse of mod_mul_write which adds).
+    mod_sub_qq_fast(b, acc, &lo, p);
+    mod_sub_qq_fast(b, acc, &hi, p);
+    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
+    mod_sub_qq_fast(b, acc, &hi, p);
+    for _ in 0..2 { mod_double_inplace_fast(b, &hi, p); }
+    mod_add_qq_fast(b, acc, &hi, p);
+    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
+    mod_sub_qq_fast(b, acc, &hi, p);
+    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
+    mod_sub_qq_fast(b, acc, &hi, p);
+    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
+    for _ in 0..10 {
+        mod_halve_inplace_fast(b, &hi, p);
+    }
+
+    karatsuba_inverse(b, x, y, tmp_ext, &z1_reg);
+    b.free_vec(&z1_reg);
+}
+
 /// Add x*y mod p to acc, via schoolbook into a wide accumulator + Solinas
 /// reduction + Bennett uncompute. Saves ~100k CCX vs Horner-on-acc per call.
 fn mod_mul_add_into_acc_schoolbook(
@@ -4480,6 +4521,53 @@ mod tests {
         let mut h = Shake256::default();
         Update::update(&mut h, b"test-qrom");
         h.finalize_xof()
+    }
+
+    /// Verify mod_mul_sub_from_acc is inverse of mod_mul_write_into_zero_acc: roundtrip → acc=0.
+    #[test]
+    fn test_mod_mul_roundtrip() {
+        use sha3::digest::XofReader;
+        let p = SECP256K1_P;
+        let n = 256;
+        let b = &mut B::new();
+        let x = b.alloc_qubits(n);
+        let y = b.alloc_qubits(n);
+        let acc = b.alloc_qubits(n);
+        let tmp_ext = b.alloc_qubits(2 * n);
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &acc, &x, &y, p, &tmp_ext);
+        mod_mul_sub_from_acc_karatsuba_with_tmp_ext(b, &acc, &x, &y, p, &tmp_ext);
+        let ops = b.ops.clone();
+        let nq = b.next_qubit;
+        let nb = b.next_bit;
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof);
+        sim.clear_for_shot();
+        let mut vxof = make_xof();
+        for shot in 0..64 {
+            let mut rb = [0u8; 32];
+            vxof.read(&mut rb);
+            let xv = U256::from_le_bytes(rb) % p;
+            vxof.read(&mut rb);
+            let yv = U256::from_le_bytes(rb) % p;
+            for j in 0..n {
+                if xv.bit(j) { *sim.qubit_mut(x[j]) |= 1u64 << shot; }
+                if yv.bit(j) { *sim.qubit_mut(y[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+        let mut dirty_acc = 0;
+        for j in 0..n {
+            if sim.qubit(acc[j]) != 0 { dirty_acc += 1; }
+        }
+        let mut dirty_tmp = 0;
+        for j in 0..(2*n) {
+            if sim.qubit(tmp_ext[j]) != 0 { dirty_tmp += 1; }
+        }
+        eprintln!("mod_mul roundtrip: dirty_acc={}/256, dirty_tmp={}/512, phase=0x{:x}",
+            dirty_acc, dirty_tmp, sim.global_phase());
+        assert_eq!(dirty_acc, 0);
+        assert_eq!(dirty_tmp, 0);
+        assert_eq!(sim.global_phase(), 0);
     }
 
     /// Test Montgomery BOTH recoveries: dx^-1 AND (Rx-Qx)^-1 from one Kaliski.
