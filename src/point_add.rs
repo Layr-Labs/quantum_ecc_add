@@ -3313,7 +3313,8 @@ fn kaliski_iteration_hrsl(
     // STEP 15: cswap back (r, s)
     for i in 0..n { cswap(b, a_q, r[i], s[i]); }
 
-    // STEP 16 DIAGNOSTIC: drop uncompute, let b.free() strict-apply check fire.
+    // STEP 16: uncompute a_q via r[0] parity (MS invariant: a_q == r[0] at this point).
+    b.cx(r[0], a_q);
 
     b.free(b_q);
     b.free(a_q);
@@ -4082,6 +4083,132 @@ mod tests {
         let mut h = Shake256::default();
         Update::update(&mut h, b"test-qrom");
         h.finalize_xof()
+    }
+
+    /// Unit test: kaliski_forward_hrsl on v_in=3, check st.r matches expected.
+    #[test]
+    fn test_hrsl_kaliski_forward_small() {
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 260;  // enough to converge for small v
+        let n = 256;
+
+        let b = &mut B::new();
+        let v_in = b.alloc_qubits(n);
+        let st = alloc_kaliski_state(b, n, iters);
+        kaliski_forward_hrsl(b, &v_in, &st, p, iters);
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        let v_val = U256::from(7u64);
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+        for j in 0..n {
+            if v_val.bit(j) {
+                for shot in 0..64 {
+                    *sim.qubit_mut(v_in[j]) |= 1u64 << shot;
+                }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let vinv = classical_modinv(v_val, p);
+        let two_k = pow_mod_2_k(p, iters);
+        let expected_pos = mulmod(vinv, two_k, p);
+        let expected_neg = if expected_pos.is_zero() { U256::ZERO } else { p.wrapping_sub(expected_pos) };
+
+        let mut got = U256::ZERO;
+        for j in 0..n {
+            if (sim.qubit(st.r[j]) >> 0) & 1 == 1 {
+                got |= U256::from(1) << j;
+            }
+        }
+        eprintln!("HRSL forward v=7, iters={}: got=0x{:x} exp+=0x{:x} exp-=0x{:x}",
+            iters, got, expected_pos, expected_neg);
+
+        // Also check u, v_w, s at end
+        let mut u_got = U256::ZERO;
+        let mut v_got = U256::ZERO;
+        let mut s_got = U256::ZERO;
+        for j in 0..n {
+            if (sim.qubit(st.u[j]) >> 0) & 1 == 1 { u_got |= U256::from(1) << j; }
+            if (sim.qubit(st.v_w[j]) >> 0) & 1 == 1 { v_got |= U256::from(1) << j; }
+            if (sim.qubit(st.s[j]) >> 0) & 1 == 1 { s_got |= U256::from(1) << j; }
+        }
+        eprintln!("  u=0x{:x} v_w=0x{:x} s=0x{:x}", u_got, v_got, s_got);
+    }
+
+    /// HRSL forward + backward roundtrip: state should return to 0.
+    #[test]
+    fn test_hrsl_kaliski_roundtrip() {
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 260;
+        let n = 256;
+
+        let b = &mut B::new();
+        let v_in = b.alloc_qubits(n);
+        let st = alloc_kaliski_state(b, n, iters);
+        kaliski_forward_hrsl(b, &v_in, &st, p, iters);
+        kaliski_backward_hrsl(b, &v_in, &st, p, iters);
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        let v_val = U256::from(7u64);
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+        for j in 0..n {
+            if v_val.bit(j) {
+                for shot in 0..64 {
+                    *sim.qubit_mut(v_in[j]) |= 1u64 << shot;
+                }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        // Check: v_in unchanged, st.* all zero.
+        let mut v_final = U256::ZERO;
+        for j in 0..n {
+            if (sim.qubit(v_in[j]) >> 0) & 1 == 1 { v_final |= U256::from(1) << j; }
+        }
+        eprintln!("roundtrip: v_in_final = 0x{:x} (expected 0x{:x})", v_final, v_val);
+        assert_eq!(v_final, v_val, "v_in corrupted by roundtrip");
+
+        let mut dirty_qubits = 0;
+        let u_start = n as u32;
+        let v_start = u_start + n as u32;
+        let r_start = v_start + n as u32;
+        let s_start = r_start + n as u32;
+        let m_start = s_start + n as u32;
+        let mut u_dirty = 0;
+        let mut v_dirty = 0;
+        let mut r_dirty = 0;
+        let mut s_dirty = 0;
+        let mut m_dirty = 0;
+        let mut other_dirty = 0;
+        for q in (n as u32)..num_qubits {
+            let qid = QubitId(q);
+            let val = sim.qubit(qid);
+            if val != 0 {
+                dirty_qubits += 1;
+                if q < v_start { u_dirty += 1; }
+                else if q < r_start { v_dirty += 1; }
+                else if q < s_start { r_dirty += 1; }
+                else if q < m_start { s_dirty += 1; }
+                else if q < m_start + iters as u32 { m_dirty += 1; }
+                else { other_dirty += 1; }
+            }
+        }
+        eprintln!("dirty: u={} v_w={} r={} s={} m_hist={} other={} total={}",
+            u_dirty, v_dirty, r_dirty, s_dirty, m_dirty, other_dirty, dirty_qubits);
+        let phase = sim.global_phase();
+        eprintln!("phase = 0x{:x}", phase);
     }
 
     /// Count CCX ops in the flat vs Bennett qrom implementations.
