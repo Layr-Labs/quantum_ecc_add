@@ -3431,8 +3431,10 @@ fn kaliski_iteration_hrsl(
     // STEP 15: cswap back (r, s)
     for i in 0..n { cswap(b, a_q, r[i], s[i]); }
 
-    // STEP 16: uncompute a_q via r[0] parity (gated on f — post-conv a_q=0 already).
-    b.ccx(f_flag, r[0], a_q);
+    // STEP 16: uncompute a_q. Try baseline's `a ^= NOT s[0]` pattern.
+    b.x(s[0]);
+    b.cx(s[0], a_q);
+    b.x(s[0]);
 
     b.free(b_q);
     b.free(a_q);
@@ -3463,8 +3465,10 @@ fn kaliski_iteration_hrsl_backward(
     let a_q = b.alloc_qubit();
     let b_q = b.alloc_qubit();
 
-    // Reverse STEP 16: a_q = f AND r[0] (pre-uncompute state)
-    b.ccx(f_flag, r[0], a_q);
+    // Reverse STEP 16: a_q ^= NOT s[0] (mirror of baseline pattern).
+    b.x(s[0]);
+    b.cx(s[0], a_q);
+    b.x(s[0]);
 
     // Reverse STEP 15, 14: cswap back
     for i in 0..n { cswap(b, a_q, r[i], s[i]); }
@@ -4174,7 +4178,7 @@ pub fn build() -> Vec<Op> {
 
     let lam = b.alloc_qubits(N);
 
-    // Pair 1: baseline Kaliski (HRSL infra tested but broken for heterogeneous inputs).
+    // Pair 1: baseline Kaliski (HRSL's STEP 16 now ok via a^=NOT s[0], but still ~8K shots classical FAIL).
     with_kal_inv_raw_scratch(b, &tx, p, K1, STEP0_SKIP_1, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
