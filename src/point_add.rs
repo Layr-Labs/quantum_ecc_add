@@ -4256,6 +4256,79 @@ mod tests {
         eprintln!("phase = 0x{:x}", phase);
     }
 
+    /// Reproduce build() pair 1 body inside HRSL wrapper: mul + halve + mul.
+    /// This should expose the bug currently only visible in full build().
+    #[test]
+    fn test_hrsl_wrapper_with_mul_body() {
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 511;
+        let n = 256;
+
+        let b = &mut B::new();
+        let v_in = b.alloc_qubits(n);  // dx
+        let ty = b.alloc_qubits(n);    // dy
+        let lam = b.alloc_qubits(n);   // output scratch
+
+        with_kal_inv_hrsl(b, &v_in, p, iters, |b, inv_raw, scratch| {
+            let tmp_lo = b.alloc_qubits(2 * n - scratch.len());
+            let mut tmp_ext = tmp_lo.clone();
+            tmp_ext.extend_from_slice(scratch);
+            mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &lam, &ty, inv_raw, p, &tmp_ext);
+            for _ in 0..iters { mod_halve_inplace_fast(b, &lam, p); }
+            mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &v_in, p, &tmp_ext);
+            b.free_vec(&tmp_lo);
+        });
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        // Set v_in = 7, ty = 11 (random small values).
+        let v_val = U256::from(7u64);
+        let ty_val = U256::from(11u64);
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+        for j in 0..n {
+            if v_val.bit(j) {
+                for shot in 0..64 { *sim.qubit_mut(v_in[j]) |= 1u64 << shot; }
+            }
+            if ty_val.bit(j) {
+                for shot in 0..64 { *sim.qubit_mut(ty[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        // Expected: ty = 0 (since ty -= lam × tx = ty - ty × dx^-1 × dx = 0).
+        // lam = -λ = -ty_orig × dx^-1 mod p.
+        let mut ty_final = U256::ZERO;
+        let mut lam_final = U256::ZERO;
+        let mut v_final = U256::ZERO;
+        for j in 0..n {
+            if (sim.qubit(ty[j]) >> 0) & 1 == 1 { ty_final |= U256::from(1) << j; }
+            if (sim.qubit(lam[j]) >> 0) & 1 == 1 { lam_final |= U256::from(1) << j; }
+            if (sim.qubit(v_in[j]) >> 0) & 1 == 1 { v_final |= U256::from(1) << j; }
+        }
+        let vinv = classical_modinv(v_val, p);
+        let lam_expected_pos = mulmod(ty_val, vinv, p);
+        let lam_expected_neg = if lam_expected_pos.is_zero() { U256::ZERO } else { p.wrapping_sub(lam_expected_pos) };
+        eprintln!("v_final=0x{:x}  ty_final=0x{:x}  lam_final=0x{:x}", v_final, ty_final, lam_final);
+        eprintln!("  lam exp+ = 0x{:x}", lam_expected_pos);
+        eprintln!("  lam exp- = 0x{:x}", lam_expected_neg);
+
+        let mut dirty = 0;
+        let phase = sim.global_phase();
+        for q in 0..num_qubits {
+            // Exclude v_in, ty, lam from dirty check — they're "output" registers.
+            let is_output = (q as usize) < 3 * n;
+            if is_output { continue; }
+            let val = sim.qubit(QubitId(q));
+            if val != 0 { dirty += 1; }
+        }
+        eprintln!("  dirty(scratch)={} phase=0x{:x}", dirty, phase);
+    }
+
     /// Test with_kal_inv_hrsl with body = CX-copy r to a fresh register.
     #[test]
     fn test_hrsl_wrapper_copy_r() {
