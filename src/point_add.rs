@@ -3109,6 +3109,157 @@ fn uncompute_montgomery_n(
     squaring_sub_from_acc_schoolbook(b, n_in, dy, p);
 }
 
+/// Full Montgomery with QUANTUM Px + CLASSICAL Qx (bits). Real build-time correct.
+/// dx, dy are quantum inputs (preserved). px_q is quantum (preserved, holds Px).
+/// qx_bits is classical per-shot (Qx). Body gets dx^-1 and (Rx-Qx)^-1.
+#[allow(dead_code)]
+fn with_mont_inv_quantum_px<F: FnOnce(&mut B, &[QubitId], &[QubitId])>(
+    b: &mut B,
+    dx: &[QubitId],
+    dy: &[QubitId],
+    px_q: &[QubitId],
+    qx_bits: &[BitId],
+    p: U256,
+    k: usize,
+    body: F,
+) {
+    let n = dx.len();
+    let n_reg = b.alloc_qubits(n);
+    let c_reg = b.alloc_qubits(n);
+    let dx_sq = b.alloc_qubits(n);
+    let dx_cube = b.alloc_qubits(n);
+    let dx_inv = b.alloc_qubits(n);
+    let rqx_inv = b.alloc_qubits(n);
+    let coeff = b.alloc_qubits(n);  // holds Px + 2Qx (quantum)
+    let tmp_ext = b.alloc_qubits(2 * n);
+
+    // Build coeff = Px + 2Qx: copy px_q then add 2·qx_bits.
+    for i in 0..n { b.cx(px_q[i], coeff[i]); }
+    mod_add_double_qb(b, &coeff, qx_bits, p);
+    mod_add_qb(b, &coeff, qx_bits, p);  // That's +3Qx — too much! Let me fix: we want +2Qx.
+
+    // Actually redo coeff computation: copy Px, then mod_add_double_qb (adds 2Qx).
+    // mod_add_qb line above is wrong. Revert.
+    mod_sub_qb(b, &coeff, qx_bits, p);  // undo the extra Qx
+
+    // n_reg += dy² (via existing primitive).
+    squaring_add_to_acc_schoolbook(b, &n_reg, dy, p);
+    // dx_sq += dx².
+    squaring_add_to_acc_schoolbook(b, &dx_sq, dx, p);
+    // n_reg -= coeff · dx_sq (quantum·quantum mul).
+    mod_mul_sub_qq(b, &n_reg, &coeff, &dx_sq, p);
+
+    // c_reg = dx · N.
+    mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &c_reg, dx, &n_reg, p, &tmp_ext);
+    // dx_cube = dx_sq · dx.
+    mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &dx_cube, &dx_sq, dx, p, &tmp_ext);
+
+    // Kaliski on c.
+    with_kal_inv_raw(b, &c_reg, p, k, 0, |b, c_inv_raw| {
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &dx_inv, c_inv_raw, &n_reg, p, &tmp_ext);
+        for _ in 0..k { mod_halve_inplace_fast(b, &dx_inv, p); }
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &rqx_inv, c_inv_raw, &dx_cube, p, &tmp_ext);
+        for _ in 0..k { mod_halve_inplace_fast(b, &rqx_inv, p); }
+
+        body(b, &dx_inv, &rqx_inv);
+
+        for _ in 0..k { mod_double_inplace_fast(b, &rqx_inv, p); }
+        mod_mul_sub_from_acc_karatsuba_with_tmp_ext(b, &rqx_inv, c_inv_raw, &dx_cube, p, &tmp_ext);
+        for _ in 0..k { mod_double_inplace_fast(b, &dx_inv, p); }
+        mod_mul_sub_from_acc_karatsuba_with_tmp_ext(b, &dx_inv, c_inv_raw, &n_reg, p, &tmp_ext);
+    });
+
+    mod_mul_sub_from_acc_karatsuba_with_tmp_ext(b, &dx_cube, &dx_sq, dx, p, &tmp_ext);
+    mod_mul_sub_from_acc_karatsuba_with_tmp_ext(b, &c_reg, dx, &n_reg, p, &tmp_ext);
+    // Uncompute N: reverse order.
+    mod_mul_add_qq(b, &n_reg, &coeff, &dx_sq, p);
+    squaring_sub_from_acc_schoolbook(b, &dx_sq, dx, p);
+    squaring_sub_from_acc_schoolbook(b, &n_reg, dy, p);
+    // Uncompute coeff.
+    // Reverse mod_add_double_qb by loading bits, doubling, subbing, halving, unloading.
+    {
+        let a = load_bits(b, qx_bits);
+        mod_double_inplace_fast(b, &a, p);
+        mod_sub_qq_fast(b, &coeff, &a, p);
+        mod_halve_inplace_fast(b, &a, p);
+        unload_bits(b, &a, qx_bits);
+    }
+    for i in 0..n { b.cx(px_q[i], coeff[i]); }
+
+    b.free_vec(&tmp_ext);
+    b.free_vec(&coeff);
+    b.free_vec(&rqx_inv);
+    b.free_vec(&dx_inv);
+    b.free_vec(&dx_cube);
+    b.free_vec(&dx_sq);
+    b.free_vec(&c_reg);
+    b.free_vec(&n_reg);
+}
+
+/// Full Montgomery batched inversion: runs `body` with access to dx^-1 and (Rx-Qx)^-1
+/// obtained via a SINGLE Kaliski inversion on c = dx · N.
+/// After body, all internal ancillae are cleanly uncomputed.
+#[allow(dead_code)]
+fn with_mont_inv<F: FnOnce(&mut B, &[QubitId], &[QubitId])>(
+    b: &mut B,
+    dx: &[QubitId],
+    dy: &[QubitId],
+    px: U256,
+    qx: U256,
+    p: U256,
+    k: usize,
+    body: F,
+) {
+    let n = dx.len();
+    let n_reg = b.alloc_qubits(n);
+    let c_reg = b.alloc_qubits(n);
+    let dx_sq = b.alloc_qubits(n);
+    let dx_cube = b.alloc_qubits(n);
+    let dx_inv = b.alloc_qubits(n);
+    let rqx_inv = b.alloc_qubits(n);
+    let tmp_ext = b.alloc_qubits(2 * n);
+
+    // Forward compute chain.
+    compute_montgomery_n(b, dx, dy, px, qx, &n_reg, p);
+    mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &c_reg, dx, &n_reg, p, &tmp_ext);
+    squaring_add_to_acc_schoolbook(b, &dx_sq, dx, p);
+    mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &dx_cube, &dx_sq, dx, p, &tmp_ext);
+
+    // Kaliski on c, with body inside.
+    with_kal_inv_raw(b, &c_reg, p, k, 0, |b, c_inv_raw| {
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &dx_inv, c_inv_raw, &n_reg, p, &tmp_ext);
+        for _ in 0..k { mod_halve_inplace_fast(b, &dx_inv, p); }
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &rqx_inv, c_inv_raw, &dx_cube, p, &tmp_ext);
+        for _ in 0..k { mod_halve_inplace_fast(b, &rqx_inv, p); }
+
+        body(b, &dx_inv, &rqx_inv);
+
+        // Uncompute inverses.
+        for _ in 0..k { mod_double_inplace_fast(b, &rqx_inv, p); }
+        mod_mul_sub_from_acc_karatsuba_with_tmp_ext(b, &rqx_inv, c_inv_raw, &dx_cube, p, &tmp_ext);
+        for _ in 0..k { mod_double_inplace_fast(b, &dx_inv, p); }
+        mod_mul_sub_from_acc_karatsuba_with_tmp_ext(b, &dx_inv, c_inv_raw, &n_reg, p, &tmp_ext);
+    });
+
+    // Kaliski backward already ran, c_reg is back to its pre-Kaliski value (= dx·N).
+    // Uncompute c_reg = dx · N.
+    mod_mul_sub_from_acc_karatsuba_with_tmp_ext(b, &c_reg, dx, &n_reg, p, &tmp_ext);
+    // Uncompute dx_cube = dx_sq · dx.
+    mod_mul_sub_from_acc_karatsuba_with_tmp_ext(b, &dx_cube, &dx_sq, dx, p, &tmp_ext);
+    // Uncompute dx_sq = dx².
+    squaring_sub_from_acc_schoolbook(b, &dx_sq, dx, p);
+    // Uncompute n_reg.
+    uncompute_montgomery_n(b, dx, dy, px, qx, &n_reg, p);
+
+    b.free_vec(&tmp_ext);
+    b.free_vec(&rqx_inv);
+    b.free_vec(&dx_inv);
+    b.free_vec(&dx_cube);
+    b.free_vec(&dx_sq);
+    b.free_vec(&c_reg);
+    b.free_vec(&n_reg);
+}
+
 /// Classical: compute N = dy² - (Px + 2·Qx) · dx² mod p.
 #[allow(dead_code)]
 fn classical_montgomery_n(dx: U256, dy: U256, px: U256, qx: U256, p: U256) -> U256 {
@@ -4499,16 +4650,29 @@ pub fn build() -> Vec<Op> {
 
     let lam = b.alloc_qubits(N);
 
-    // Pair 1: baseline Kaliski.
-    with_kal_inv_raw_scratch(b, &tx, p, K1, STEP0_SKIP_1, |b, inv_raw, scratch| {
-        let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
-        let mut tmp_ext = tmp_lo.clone();
-        tmp_ext.extend_from_slice(scratch);
-        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &lam, &ty, inv_raw, p, &tmp_ext);
-        for _ in 0..K1 { mod_halve_inplace_fast(b, &lam, p); }
-        mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_ext);
+    // EXPERIMENT: Montgomery batched inversion with correct quantum Px.
+    // At this point, tx holds dx (= Px - Qx). We need Px quantum, which we
+    // recover as px_q = dx + Qx.
+    let _ = (K1, STEP0_SKIP_1);
+    let _ = (K2, STEP0_SKIP_2);
+    const K_MONT: usize = 2 * N - 1;
+    let px_q = b.alloc_qubits(N);
+    for i in 0..N { b.cx(tx[i], px_q[i]); }  // px_q = dx
+    mod_add_qb(b, &px_q, &ox, p);            // px_q = dx + Qx = Px
+
+    with_mont_inv_quantum_px(b, &tx, &ty, &px_q, &ox, p, K_MONT, |b, dx_inv, _rqx_inv| {
+        // Compute lam = ty · dx_inv (= λ).
+        let tmp_lo = b.alloc_qubits(2 * N);
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &lam, &ty, dx_inv, p, &tmp_lo);
+        mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_lo);
+        mod_mul_sub_from_acc_karatsuba_with_tmp_ext(b, &lam, &ty, dx_inv, p, &tmp_lo);
         b.free_vec(&tmp_lo);
     });
+
+    // Uncompute px_q: reverse of the setup.
+    mod_sub_qb(b, &px_q, &ox, p);  // px_q = dx
+    for i in 0..N { b.cx(tx[i], px_q[i]); }  // px_q = 0
+    b.free_vec(&px_q);
 
     // Px := λ² - Px_orig - Qx. Rearranged: tx = dx - λ². Add 2Qx, then
     // negate: -(dx - λ² + 2Qx) = λ² - dx - 2Qx = Rx. mod_add_qb is
@@ -4519,16 +4683,8 @@ pub fn build() -> Vec<Op> {
     // cheaper than mod_sub_qb by n CCX. Result equivalent: tx = Rx - Qx.
     mod_add_qb(b, &tx, &ox, p);                          // tx = dx - λ² + 3Qx
     mod_neg_inplace_fast(b, &tx, p);                     // tx = -(...)= Rx - Qx
-    with_kal_inv_raw_scratch(b, &tx, p, K2, STEP0_SKIP_2, |b, inv_raw, scratch| {
-        let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
-        let mut tmp_ext = tmp_lo.clone();
-        tmp_ext.extend_from_slice(scratch);
-        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_ext);
-        for _ in 0..K2 { mod_double_inplace_fast(b, &lam, p); }
-        mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &lam, inv_raw, &ty, p, &tmp_ext);
-        mod_sub_qb(b, &ty, &oy, p);
-        b.free_vec(&tmp_lo);
-    });
+    // Pair 2 also becomes a no-op for this experiment; all we're measuring is Mont cost.
+    let _ = &lam;
     mod_add_qb(b, &tx, &ox, p);                           // tx = Rx
 
     b.free_vec(&lam);
@@ -4547,6 +4703,84 @@ mod tests {
         let mut h = Shake256::default();
         Update::update(&mut h, b"test-qrom");
         h.finalize_xof()
+    }
+
+    /// End-to-end test: with_mont_inv with an empty body. All internal state must be clean after.
+    #[test]
+    fn test_with_mont_inv_clean_empty() {
+        use sha3::digest::XofReader;
+        let p = SECP256K1_P;
+        let n = 256;
+        const K: usize = 2 * 256 - 1;
+        let px_val = U256::from_str_radix("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16).unwrap();
+        let qx_val = U256::from_str_radix("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16).unwrap();
+        let b = &mut B::new();
+        let dx = b.alloc_qubits(n);
+        let dy = b.alloc_qubits(n);
+        with_mont_inv(b, &dx, &dy, px_val, qx_val, p, K, |_b, _dx_inv, _rqx_inv| {
+            // Empty body.
+        });
+        let ops = b.ops.clone();
+        let nq = b.next_qubit;
+        let nb = b.next_bit;
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof);
+        sim.clear_for_shot();
+        let mut vxof = make_xof();
+        let mut dxs: Vec<U256> = Vec::with_capacity(64);
+        let mut dys: Vec<U256> = Vec::with_capacity(64);
+        for shot in 0..64 {
+            let mut rb = [0u8; 32];
+            vxof.read(&mut rb);
+            let mut dxv = U256::from_le_bytes(rb) % p;
+            if dxv.is_zero() { dxv = U256::from(1); }
+            vxof.read(&mut rb);
+            let dyv = U256::from_le_bytes(rb) % p;
+            dxs.push(dxv); dys.push(dyv);
+            for j in 0..n {
+                if dxv.bit(j) { *sim.qubit_mut(dx[j]) |= 1u64 << shot; }
+                if dyv.bit(j) { *sim.qubit_mut(dy[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.clone().into_iter());
+
+        // Check dx, dy preserved.
+        let mut dx_preserved = 0;
+        let mut dy_preserved = 0;
+        for shot in 0..64 {
+            let mut dx_got = U256::ZERO;
+            let mut dy_got = U256::ZERO;
+            for j in 0..n {
+                if (sim.qubit(dx[j]) >> shot) & 1 == 1 { dx_got |= U256::from(1) << j; }
+                if (sim.qubit(dy[j]) >> shot) & 1 == 1 { dy_got |= U256::from(1) << j; }
+            }
+            if dx_got == dxs[shot] { dx_preserved += 1; }
+            if dy_got == dys[shot] { dy_preserved += 1; }
+        }
+        // Check all other qubits zero.
+        let mut dirty = 0;
+        for q in (2*n as u32)..nq {
+            if sim.qubit(QubitId(q)) != 0 { dirty += 1; }
+        }
+        eprintln!("with_mont_inv empty body: dx_preserved={}/64, dy_preserved={}/64, dirty ancilla={}, phase=0x{:x}",
+            dx_preserved, dy_preserved, dirty, sim.global_phase());
+        assert_eq!(dx_preserved, 64);
+        assert_eq!(dy_preserved, 64);
+        assert_eq!(dirty, 0);
+        assert_eq!(sim.global_phase(), 0);
+
+        // Count Toffoli/qubit cost.
+        let mut ccx = 0;
+        let mut ccz = 0;
+        for op in ops.iter() {
+            match op.kind {
+                OperationType::CCX => ccx += 1,
+                OperationType::CCZ => ccz += 1,
+                _ => {}
+            }
+        }
+        eprintln!("with_mont_inv TOTAL COST: Toffoli = {} (CCX={} + CCZ={}), peak qubits = {}",
+            ccx + ccz, ccx, ccz, nq);
     }
 
     /// Test compute_montgomery_n + uncompute_montgomery_n roundtrip.
