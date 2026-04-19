@@ -3443,9 +3443,8 @@ fn kaliski_iteration_hrsl(
     let a_q = b.alloc_qubit();
     let b_q = b.alloc_qubit();
 
-    // STEP 0: update f via termination check. Skip for early iters (provably v ≠ 0).
-    const HRSL_STEP0_SKIP: usize = 241;
-    if iter_idx >= HRSL_STEP0_SKIP {
+    // STEP 0: update f via termination check.
+    {
         let or_width = if iter_idx < n { n } else { 2 * n - iter_idx };
         let zero_flag = b.alloc_qubit();
         with_eq_zero_fast(b, &v[0..or_width], zero_flag, |b| {
@@ -3473,34 +3472,37 @@ fn kaliski_iteration_hrsl(
     b.x(a_q);
     b.x(v[0]);
 
-    // STEP 3: compare u > v, result in carry
+    // STEPS 3+4+5 fused via with_gt (HMR uncompute saves n CCX per iter).
     let carry = b.alloc_qubit();
-    cmp_lt_into_fast(b, v, u, carry);
-
-    // STEP 4: tree of CNOTs + decision updates (gated on f)
-    b.cx(a_q, b_q);
-    b.cx(m_hist, b_q);
-    b.x(b_q);
-    {
-        let fc = b.alloc_qubit();
-        b.ccx(f_flag, carry, fc);
-        b.ccx(fc, b_q, a_q);
-        b.ccx(fc, b_q, m_hist);
-        b.ccx(f_flag, carry, fc);
-        b.free(fc);
-    }
-    b.x(b_q);
-    b.cx(m_hist, b_q);
-    b.cx(a_q, b_q);
-
-    // STEP 5: uncompute carry
-    cmp_lt_into_fast(b, v, u, carry);
+    with_gt(b, u, v, carry, |b| {
+        // STEP 4: tree of CNOTs + decision updates (gated on f). Use Gidney
+        // AND uncompute for fc (saves 1 CCX per iter).
+        b.cx(a_q, b_q);
+        b.cx(m_hist, b_q);
+        b.x(b_q);
+        {
+            let fc = b.alloc_qubit();
+            b.ccx(f_flag, carry, fc);
+            b.ccx(fc, b_q, a_q);
+            b.ccx(fc, b_q, m_hist);
+            // HMR-based uncompute of fc (= f AND carry): 0 CCX.
+            let fcm = b.alloc_bit();
+            b.hmr(fc, fcm);
+            b.cz_if(f_flag, carry, fcm);
+            b.free(fc);
+        }
+        b.x(b_q);
+        b.cx(m_hist, b_q);
+        b.cx(a_q, b_q);
+    });
     b.free(carry);
 
-    // STEP 6: cswap(a_q, u, v)
-    for i in 0..n { cswap(b, a_q, u[i], v[i]); }
-    // STEP 7: cswap(a_q, r, s)
-    for i in 0..n { cswap(b, a_q, r[i], s[i]); }
+    // STEP 6: cswap(a_q, u, v) — late-iter truncation (bitlen u+v ≤ 2n-iter).
+    let uv_width = if iter_idx < n { n } else { 2 * n - iter_idx };
+    for i in 0..uv_width { cswap(b, a_q, u[i], v[i]); }
+    // STEP 7: cswap(a_q, r, s) — small-iter truncation (max(r,s) ≤ 2^iter).
+    let rs_width_pre = if iter_idx + 1 < n { iter_idx + 1 } else { n };
+    for i in 0..rs_width_pre { cswap(b, a_q, r[i], s[i]); }
 
     // STEP 8: flip a_q for sub/add control (gated on f)
     b.ccx(f_flag, m_hist, a_q);
@@ -3539,13 +3541,19 @@ fn kaliski_iteration_hrsl(
     // STEP 12: halve v (shift right, v[0]=0 invariant after sub)
     for i in 0..(n - 1) { b.swap(v[i], v[i + 1]); }
 
-    // STEP 13: double r mod p
-    mod_double_inplace_fast(b, r, p);
+    // STEP 13: double r mod p (no-corr for early iters, Solinas for late).
+    // Use 255 as safe threshold (n-1) — r bitlen ≤ iter_idx+1 by induction, so top bit is 0.
+    if iter_idx < 255 {
+        mod_double_no_corr(b, r);
+    } else {
+        mod_double_inplace_fast(b, r, p);
+    }
 
-    // STEP 14: cswap back (u, v)
-    for i in 0..n { cswap(b, a_q, u[i], v[i]); }
-    // STEP 15: cswap back (r, s)
-    for i in 0..n { cswap(b, a_q, r[i], s[i]); }
+    // STEP 14: cswap back (u, v) — same width as STEP 6.
+    for i in 0..uv_width { cswap(b, a_q, u[i], v[i]); }
+    // STEP 15: cswap back (r, s) — post-STEP-10, s could grow one bit.
+    let rs_width_post = if iter_idx + 2 < n { iter_idx + 2 } else { n };
+    for i in 0..rs_width_post { cswap(b, a_q, r[i], s[i]); }
 
     // STEP 16: uncompute a_q. Try baseline's `a ^= NOT s[0]` pattern.
     b.x(s[0]);
@@ -3586,12 +3594,18 @@ fn kaliski_iteration_hrsl_backward(
     b.cx(s[0], a_q);
     b.x(s[0]);
 
-    // Reverse STEP 15, 14: cswap back
-    for i in 0..n { cswap(b, a_q, r[i], s[i]); }
-    for i in 0..n { cswap(b, a_q, u[i], v[i]); }
+    // Reverse STEP 15, 14: cswap back with matching widths.
+    let uv_width = if iter_idx < n { n } else { 2 * n - iter_idx };
+    let rs_width_post = if iter_idx + 2 < n { iter_idx + 2 } else { n };
+    for i in 0..rs_width_post { cswap(b, a_q, r[i], s[i]); }
+    for i in 0..uv_width { cswap(b, a_q, u[i], v[i]); }
 
-    // Reverse STEP 13: halve r (inverse of double)
-    mod_halve_inplace_fast(b, r, p);
+    // Reverse STEP 13: halve r (inverse of double).
+    if iter_idx < 255 {
+        mod_halve_no_corr(b, r);
+    } else {
+        mod_halve_inplace_fast(b, r, p);
+    }
 
     // Reverse STEP 12: un-halve v (shift left)
     for i in (0..(n - 1)).rev() { b.swap(v[i], v[i + 1]); }
@@ -3630,32 +3644,32 @@ fn kaliski_iteration_hrsl_backward(
     b.cx(f_flag, a_q);
     b.ccx(f_flag, m_hist, a_q);
 
-    // Reverse STEP 7, 6: cswap
-    for i in 0..n { cswap(b, a_q, r[i], s[i]); }
-    for i in 0..n { cswap(b, a_q, u[i], v[i]); }
+    // Reverse STEP 7, 6: cswap with matching widths.
+    let rs_width_pre = if iter_idx + 1 < n { iter_idx + 1 } else { n };
+    for i in 0..rs_width_pre { cswap(b, a_q, r[i], s[i]); }
+    for i in 0..uv_width { cswap(b, a_q, u[i], v[i]); }
 
-    // Reverse STEP 5: compute carry
+    // Reverse STEPS 5+4+3 fused via with_gt.
     let carry = b.alloc_qubit();
-    cmp_lt_into_fast(b, v, u, carry);
-
-    // Reverse STEP 4: tree of CNOTs (gated on f)
-    b.cx(a_q, b_q);
-    b.cx(m_hist, b_q);
-    b.x(b_q);
-    {
-        let fc = b.alloc_qubit();
-        b.ccx(f_flag, carry, fc);
-        b.ccx(fc, b_q, m_hist);
-        b.ccx(fc, b_q, a_q);
-        b.ccx(f_flag, carry, fc);
-        b.free(fc);
-    }
-    b.x(b_q);
-    b.cx(m_hist, b_q);
-    b.cx(a_q, b_q);
-
-    // Reverse STEP 3: uncompute carry
-    cmp_lt_into_fast(b, v, u, carry);
+    with_gt(b, u, v, carry, |b| {
+        b.cx(a_q, b_q);
+        b.cx(m_hist, b_q);
+        b.x(b_q);
+        {
+            let fc = b.alloc_qubit();
+            b.ccx(f_flag, carry, fc);
+            b.ccx(fc, b_q, m_hist);
+            b.ccx(fc, b_q, a_q);
+            // HMR-based uncompute.
+            let fcm = b.alloc_bit();
+            b.hmr(fc, fcm);
+            b.cz_if(f_flag, carry, fcm);
+            b.free(fc);
+        }
+        b.x(b_q);
+        b.cx(m_hist, b_q);
+        b.cx(a_q, b_q);
+    });
     b.free(carry);
 
     // Reverse STEP 2: un-XOR m_hist (gated on f)
@@ -3676,9 +3690,8 @@ fn kaliski_iteration_hrsl_backward(
     b.ccx(f_flag, u[0], a_q);
     b.x(u[0]);
 
-    // Reverse STEP 0: undo termination flag update. Skip for early iters.
-    const HRSL_STEP0_SKIP: usize = 241;
-    if iter_idx >= HRSL_STEP0_SKIP {
+    // Reverse STEP 0: undo termination flag update.
+    {
         let or_width = if iter_idx < n { n } else { 2 * n - iter_idx };
         let zero_flag = b.alloc_qubit();
         b.cx(m_hist, f_flag);
@@ -4295,8 +4308,9 @@ pub fn build() -> Vec<Op> {
 
     let lam = b.alloc_qubits(N);
 
-    // Pair 1: baseline Kaliski.
-    with_kal_inv_raw_scratch(b, &tx, p, K1, STEP0_SKIP_1, |b, inv_raw, scratch| {
+    // Pair 1: HRSL Kaliski (with cswap truncation optimizations) at K=400.
+    let _ = STEP0_SKIP_1;
+    with_kal_inv_hrsl(b, &tx, p, K1, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
         tmp_ext.extend_from_slice(scratch);
@@ -4315,7 +4329,8 @@ pub fn build() -> Vec<Op> {
     // cheaper than mod_sub_qb by n CCX. Result equivalent: tx = Rx - Qx.
     mod_add_qb(b, &tx, &ox, p);                          // tx = dx - λ² + 3Qx
     mod_neg_inplace_fast(b, &tx, p);                     // tx = -(...)= Rx - Qx
-    with_kal_inv_raw_scratch(b, &tx, p, K2, STEP0_SKIP_2, |b, inv_raw, scratch| {
+    let _ = STEP0_SKIP_2;
+    with_kal_inv_hrsl(b, &tx, p, K2, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
         tmp_ext.extend_from_slice(scratch);
