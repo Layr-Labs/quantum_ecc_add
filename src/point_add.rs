@@ -4480,6 +4480,120 @@ mod tests {
         h.finalize_xof()
     }
 
+    /// Test Montgomery BOTH recoveries: dx^-1 AND (Rx-Qx)^-1 from one Kaliski.
+    /// (Rx-Qx)^-1 = c^-1 · dx³ = dx² · (c^-1 · dx).
+    #[test]
+    fn test_montgomery_recover_both() {
+        use sha3::digest::XofReader;
+        let p = SECP256K1_P;
+        let n = 256;
+        const K: usize = 2 * 256 - 1;
+
+        let curve = crate::weierstrass_elliptic_curve::WeierstrassEllipticCurve {
+            modulus: p,
+            a: U256::from(0),
+            b: U256::from(7),
+            gx: U256::from_str_radix("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16).unwrap(),
+            gy: U256::from_str_radix("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16).unwrap(),
+            order: U256::from_str_radix("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16).unwrap(),
+        };
+        let mut xof = make_xof();
+        let mut rb = [0u8; 32];
+        xof.read(&mut rb); let k1 = U256::from_le_bytes(rb);
+        xof.read(&mut rb); let k2 = U256::from_le_bytes(rb);
+        let (px_val, _) = curve.mul(curve.gx, curve.gy, k1);
+        let (qx_val, _) = curve.mul(curve.gx, curve.gy, k2);
+
+        let b = &mut B::new();
+        let dx = b.alloc_qubits(n);
+        let dy = b.alloc_qubits(n);
+        let n_reg = b.alloc_qubits(n);
+        let c_reg = b.alloc_qubits(n);
+        let dx_inv = b.alloc_qubits(n);
+        let rqx_inv = b.alloc_qubits(n);
+        let dx_cube = b.alloc_qubits(n);
+        let tmp_ext = b.alloc_qubits(2 * n);
+
+        compute_montgomery_n(b, &dx, &dy, px_val, qx_val, &n_reg, p);
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &c_reg, &dx, &n_reg, p, &tmp_ext);
+
+        // Compute dx_cube = dx³ mod p via: dx² add to 0 acc, then dx_cube = dx²·dx.
+        let dx_sq = b.alloc_qubits(n);
+        squaring_add_to_acc_schoolbook(b, &dx_sq, &dx, p);
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &dx_cube, &dx_sq, &dx, p, &tmp_ext);
+
+        // Kaliski on c. Inside: dx_inv = c_inv · N, rqx_inv = c_inv · dx_cube.
+        with_kal_inv_raw(b, &c_reg, p, K, 0, |b, c_inv_raw| {
+            mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &dx_inv, c_inv_raw, &n_reg, p, &tmp_ext);
+            for _ in 0..K { mod_halve_inplace_fast(b, &dx_inv, p); }
+            mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &rqx_inv, c_inv_raw, &dx_cube, p, &tmp_ext);
+            for _ in 0..K { mod_halve_inplace_fast(b, &rqx_inv, p); }
+        });
+
+        let ops = b.ops.clone();
+        let nq = b.next_qubit;
+        let nb = b.next_bit;
+        let mut xof2 = make_xof();
+        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof2);
+        sim.clear_for_shot();
+
+        let mut vxof = make_xof();
+        let mut dxs: Vec<U256> = Vec::with_capacity(64);
+        let mut dys: Vec<U256> = Vec::with_capacity(64);
+        for shot in 0..64 {
+            let mut rb2 = [0u8; 32];
+            vxof.read(&mut rb2);
+            let mut dxv = U256::from_le_bytes(rb2) % p;
+            if dxv.is_zero() { dxv = U256::from(1); }
+            vxof.read(&mut rb2);
+            let dyv = U256::from_le_bytes(rb2) % p;
+            dxs.push(dxv); dys.push(dyv);
+            for j in 0..n {
+                if dxv.bit(j) { *sim.qubit_mut(dx[j]) |= 1u64 << shot; }
+                if dyv.bit(j) { *sim.qubit_mut(dy[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let mut dx_inv_ok = 0;
+        let mut rqx_inv_ok = 0;
+        for shot in 0..64 {
+            let dxv = dxs[shot];
+            let dyv = dys[shot];
+            // Classical: Rx - Qx = (dy/dx)² - Px - 2Qx mod p.
+            let dx_inv_exp = classical_modinv(dxv, p);
+            let lam = mulmod(dyv, dx_inv_exp, p);
+            let lam2 = mulmod(lam, lam, p);
+            let rx = submod(submod(lam2, px_val, p), qx_val, p);
+            let rx_minus_qx = submod(rx, qx_val, p);
+            if rx_minus_qx.is_zero() { continue; }  // skip degenerate
+            let rqx_inv_exp = classical_modinv(rx_minus_qx, p);
+
+            let dx_inv_neg = submod(U256::ZERO, dx_inv_exp, p);
+            let rqx_inv_neg = submod(U256::ZERO, rqx_inv_exp, p);
+
+            let mut got_dx_inv = U256::ZERO;
+            let mut got_rqx_inv = U256::ZERO;
+            for j in 0..n {
+                if (sim.qubit(dx_inv[j]) >> shot) & 1 == 1 { got_dx_inv |= U256::from(1) << j; }
+                if (sim.qubit(rqx_inv[j]) >> shot) & 1 == 1 { got_rqx_inv |= U256::from(1) << j; }
+            }
+            if got_dx_inv == dx_inv_exp || got_dx_inv == dx_inv_neg { dx_inv_ok += 1; }
+            if got_rqx_inv == rqx_inv_exp || got_rqx_inv == rqx_inv_neg { rqx_inv_ok += 1; }
+            if shot < 2 && (got_dx_inv != dx_inv_exp && got_dx_inv != dx_inv_neg) {
+                eprintln!("shot {}: got_dx_inv=0x{:x} exp+=0x{:x} exp-=0x{:x}", shot, got_dx_inv, dx_inv_exp, dx_inv_neg);
+            }
+            if shot < 2 && (got_rqx_inv != rqx_inv_exp && got_rqx_inv != rqx_inv_neg) {
+                eprintln!("shot {}: got_rqx_inv=0x{:x} exp+=0x{:x} exp-=0x{:x}", shot, got_rqx_inv, rqx_inv_exp, rqx_inv_neg);
+            }
+        }
+        let _ = tmp_ext;
+        eprintln!("dx^-1: {}/64, (Rx-Qx)^-1: {}/64, phase=0x{:x}",
+            dx_inv_ok, rqx_inv_ok, sim.global_phase());
+        assert!(dx_inv_ok >= 60, "dx_inv recovery failed");
+        assert!(rqx_inv_ok >= 60, "rqx_inv recovery failed");
+    }
+
     /// Test Montgomery batched recovery: invert c = dx·N once, recover dx^-1 = c^-1 · N.
     /// Verifies against classical classical_modinv(dx).
     #[test]
