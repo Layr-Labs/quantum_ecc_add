@@ -4166,11 +4166,12 @@ pub fn build() -> Vec<Op> {
     // quantum value (dx for pair 1, Rx-Ox for pair 2); their convergence
     // distributions may differ slightly. Boundaries verified empirically
     // against 9024 Fiat-Shamir shots.
-    const K1: usize = 2 * N - 112;  // pair 1 baseline
-    const K2: usize = 2 * N - 111;  // pair 2
+    const K1: usize = 2 * N - 1;    // HRSL at K=511 safety
+    const K2: usize = 2 * N - 1;    // pair 2 at K=511 safety (HRSL stream shifts seed)
     // Per-pair STEP0_SKIP: maximum iter count below convergence for each pair.
-    const STEP0_SKIP_1: usize = 241;
-    const STEP0_SKIP_2: usize = 301;
+    let _ = (2 * N - 112, 2 * N - 111);
+    const STEP0_SKIP_1: usize = 0;  // conservative under shifted seed
+    const STEP0_SKIP_2: usize = 0;  // conservative under shifted seed
 
     // Step 1-2: Px -= Qx, Py -= Qy
     mod_sub_qb(b, &tx, &ox, p);
@@ -4178,8 +4179,9 @@ pub fn build() -> Vec<Op> {
 
     let lam = b.alloc_qubits(N);
 
-    // Pair 1: baseline Kaliski (HRSL's STEP 16 now ok via a^=NOT s[0], but still ~8K shots classical FAIL).
-    with_kal_inv_raw_scratch(b, &tx, p, K1, STEP0_SKIP_1, |b, inv_raw, scratch| {
+    // Pair 1: HRSL at K=511 safety.
+    let _ = STEP0_SKIP_1;
+    with_kal_inv_hrsl(b, &tx, p, K1, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
         tmp_ext.extend_from_slice(scratch);
@@ -4413,6 +4415,207 @@ mod tests {
 
     /// Unit test: kaliski_forward_hrsl on v_in=3, check st.r matches expected.
     #[test]
+    #[test]
+    fn test_hrsl_multi_v_with_body() {
+        use sha3::digest::XofReader;
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 511;
+        let n = 256;
+
+        let b = &mut B::new();
+        let tx = b.alloc_qubits(n);
+        let ty = b.alloc_qubits(n);
+        let lam = b.alloc_qubits(n);
+
+        with_kal_inv_hrsl(b, &tx, p, iters, |b, inv_raw, scratch| {
+            let tmp_lo = b.alloc_qubits(2 * n - scratch.len());
+            let mut tmp_ext = tmp_lo.clone();
+            tmp_ext.extend_from_slice(scratch);
+            mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &lam, &ty, inv_raw, p, &tmp_ext);
+            for _ in 0..iters { mod_halve_inplace_fast(b, &lam, p); }
+            mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_ext);
+            b.free_vec(&tmp_lo);
+        });
+
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+
+        // Initialize tx (random dx), ty (random dy), lam=0.
+        let mut dxs: Vec<U256> = Vec::with_capacity(64);
+        let mut dys: Vec<U256> = Vec::with_capacity(64);
+        let mut vxof = make_xof();
+        for shot in 0..64 {
+            let mut rb = [0u8; 32];
+            vxof.read(&mut rb);
+            let mut dx = U256::from_le_bytes(rb);
+            while dx.is_zero() || dx >= p { dx = dx.wrapping_sub(U256::from(1)); }
+            vxof.read(&mut rb);
+            let dy = U256::from_le_bytes(rb) % p;
+            dxs.push(dx);
+            dys.push(dy);
+            for j in 0..n {
+                if dx.bit(j) { *sim.qubit_mut(tx[j]) |= 1u64 << shot; }
+                if dy.bit(j) { *sim.qubit_mut(ty[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        // Check: tx preserved = dx, lam = 0, ty = ? (should be 2·dy if sign flip, or 0 if correct).
+        let mut tx_ok = 0;
+        let mut lam_ok = 0;
+        let mut ty_counts = (0usize, 0usize, 0usize);  // (ty=0, ty=2dy, ty=other)
+        for shot in 0..64 {
+            let mut tx_got = U256::ZERO;
+            let mut ty_got = U256::ZERO;
+            let mut lam_got = U256::ZERO;
+            for j in 0..n {
+                if (sim.qubit(tx[j]) >> shot) & 1 == 1 { tx_got |= U256::from(1) << j; }
+                if (sim.qubit(ty[j]) >> shot) & 1 == 1 { ty_got |= U256::from(1) << j; }
+                if (sim.qubit(lam[j]) >> shot) & 1 == 1 { lam_got |= U256::from(1) << j; }
+            }
+            if tx_got == dxs[shot] { tx_ok += 1; }
+            if lam_got == U256::ZERO { lam_ok += 1; }
+            let two_dy = mulmod(U256::from(2u64), dys[shot], p);
+            if ty_got == U256::ZERO { ty_counts.0 += 1; }
+            else if ty_got == two_dy { ty_counts.1 += 1; }
+            else { ty_counts.2 += 1; }
+        }
+        eprintln!("with_body: tx_ok={}/64, lam_ok={}/64, ty=(zero:{}, 2dy:{}, other:{}), phase=0x{:x}",
+            tx_ok, lam_ok, ty_counts.0, ty_counts.1, ty_counts.2, sim.global_phase());
+    }
+
+    #[test]
+    fn test_hrsl_multi_v_roundtrip() {
+        use sha3::digest::XofReader;
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 511;
+        let n = 256;
+
+        let b = &mut B::new();
+        let v_in = b.alloc_qubits(n);
+        let st = alloc_kaliski_state(b, n, iters);
+        kaliski_forward_hrsl(b, &v_in, &st, p, iters);
+        kaliski_backward_hrsl(b, &v_in, &st, p, iters);
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+
+        let mut vs: Vec<U256> = Vec::with_capacity(64);
+        let mut vxof = make_xof();
+        for shot in 0..64 {
+            let mut rb = [0u8; 32];
+            vxof.read(&mut rb);
+            let mut val = U256::from_le_bytes(rb);
+            while val.is_zero() || val >= p { val = val.wrapping_sub(U256::from(1)); }
+            vs.push(val);
+            for j in 0..n {
+                if val.bit(j) { *sim.qubit_mut(v_in[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let mut v_in_preserved = 0;
+        let mut state_clean = 0;
+        let mut phase_clean = true;
+        for shot in 0..64 {
+            let v_val = vs[shot];
+            let mut v_got = U256::ZERO;
+            for j in 0..n {
+                if (sim.qubit(v_in[j]) >> shot) & 1 == 1 {
+                    v_got |= U256::from(1) << j;
+                }
+            }
+            if v_got == v_val { v_in_preserved += 1; }
+
+            let mut any_dirty = false;
+            for q in st.u.iter().chain(st.v_w.iter()).chain(st.r.iter()).chain(st.s.iter()) {
+                if (sim.qubit(*q) >> shot) & 1 != 0 { any_dirty = true; break; }
+            }
+            for q in st.m_hist.iter().take(iters) {
+                if (sim.qubit(*q) >> shot) & 1 != 0 { any_dirty = true; break; }
+            }
+            if !any_dirty { state_clean += 1; }
+        }
+        if sim.global_phase() != 0 { phase_clean = false; }
+        eprintln!("HRSL roundtrip: v_preserved={}/64, state_clean={}/64, phase_clean={}",
+            v_in_preserved, state_clean, phase_clean);
+        if !phase_clean {
+            eprintln!("  global_phase = 0x{:x}", sim.global_phase());
+        }
+    }
+
+    #[test]
+    fn test_hrsl_multi_v() {
+        use sha3::digest::XofReader;
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 511;
+        let n = 256;
+
+        // Build circuit ONCE, simulate with multiple v inputs per shot.
+        let b = &mut B::new();
+        let v_in = b.alloc_qubits(n);
+        let st = alloc_kaliski_state(b, n, iters);
+        kaliski_forward_hrsl(b, &v_in, &st, p, iters);
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+
+        let mut vs: Vec<U256> = Vec::with_capacity(64);
+        let mut vxof = make_xof();
+        for shot in 0..64 {
+            let mut rb = [0u8; 32];
+            vxof.read(&mut rb);
+            let mut val = U256::from_le_bytes(rb);
+            while val.is_zero() || val >= p { val = val.wrapping_sub(U256::from(1)); }
+            vs.push(val);
+            for j in 0..n {
+                if val.bit(j) { *sim.qubit_mut(v_in[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let two_k = pow_mod_2_k(p, iters);
+        let mut passing = 0;
+        let mut failing: Vec<(usize, U256, U256, U256, U256)> = Vec::new();
+        for shot in 0..64 {
+            let v_val = vs[shot];
+            let vinv = classical_modinv(v_val, p);
+            let exp_pos = mulmod(vinv, two_k, p);
+            let exp_neg = if exp_pos.is_zero() { U256::ZERO } else { p.wrapping_sub(exp_pos) };
+            let mut got = U256::ZERO;
+            for j in 0..n {
+                if (sim.qubit(st.r[j]) >> shot) & 1 == 1 {
+                    got |= U256::from(1) << j;
+                }
+            }
+            if got == exp_pos || got == exp_neg { passing += 1; }
+            else { failing.push((shot, v_val, got, exp_pos, exp_neg)); }
+        }
+        eprintln!("HRSL forward: {}/64 pass", passing);
+        for (shot, v, got, pos, neg) in failing.iter().take(5) {
+            eprintln!("  shot {} v=0x{:x}: got=0x{:x} exp+=0x{:x} exp-=0x{:x}", shot, v, got, pos, neg);
+        }
+    }
+
     fn test_hrsl_kaliski_forward_small() {
         let p = U256::from_str_radix(
             "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
