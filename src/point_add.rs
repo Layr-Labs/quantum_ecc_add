@@ -4480,6 +4480,93 @@ mod tests {
         h.finalize_xof()
     }
 
+    /// Test Montgomery batched recovery: invert c = dx·N once, recover dx^-1 = c^-1 · N.
+    /// Verifies against classical classical_modinv(dx).
+    #[test]
+    fn test_montgomery_recover_dx_inv() {
+        use sha3::digest::XofReader;
+        let p = SECP256K1_P;
+        let n = 256;
+        const K: usize = 2 * 256 - 1;  // K=511 safety max
+
+        let curve = crate::weierstrass_elliptic_curve::WeierstrassEllipticCurve {
+            modulus: p,
+            a: U256::from(0),
+            b: U256::from(7),
+            gx: U256::from_str_radix("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16).unwrap(),
+            gy: U256::from_str_radix("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16).unwrap(),
+            order: U256::from_str_radix("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16).unwrap(),
+        };
+        let mut xof = make_xof();
+        let mut rb = [0u8; 32];
+        xof.read(&mut rb); let k1 = U256::from_le_bytes(rb);
+        xof.read(&mut rb); let k2 = U256::from_le_bytes(rb);
+        let (px_val, _) = curve.mul(curve.gx, curve.gy, k1);
+        let (qx_val, _) = curve.mul(curve.gx, curve.gy, k2);
+
+        let b = &mut B::new();
+        let dx = b.alloc_qubits(n);
+        let dy = b.alloc_qubits(n);
+        let n_reg = b.alloc_qubits(n);
+        let c_reg = b.alloc_qubits(n);
+        let dx_inv = b.alloc_qubits(n);
+        let tmp_ext = b.alloc_qubits(2 * n);
+
+        compute_montgomery_n(b, &dx, &dy, px_val, qx_val, &n_reg, p);
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &c_reg, &dx, &n_reg, p, &tmp_ext);
+
+        // Invert c via Kaliski forward. Get c_inv_raw = c^-1 · 2^K (raw output).
+        with_kal_inv_raw(b, &c_reg, p, K, 0, |b, c_inv_raw| {
+            // dx_inv_raw = c_inv_raw · N (still has 2^K factor).
+            mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &dx_inv, c_inv_raw, &n_reg, p, &tmp_ext);
+            // Halve K times to remove the 2^K factor.
+            for _ in 0..K { mod_halve_inplace_fast(b, &dx_inv, p); }
+        });
+
+        let ops = b.ops.clone();
+        let nq = b.next_qubit;
+        let nb = b.next_bit;
+        let mut xof2 = make_xof();
+        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof2);
+        sim.clear_for_shot();
+
+        let mut vxof = make_xof();
+        let mut dxs: Vec<U256> = Vec::with_capacity(64);
+        let mut dys: Vec<U256> = Vec::with_capacity(64);
+        for shot in 0..64 {
+            let mut rb2 = [0u8; 32];
+            vxof.read(&mut rb2);
+            let dxv = U256::from_le_bytes(rb2) % p;
+            let dxv = if dxv.is_zero() { U256::from(1) } else { dxv };
+            vxof.read(&mut rb2);
+            let dyv = U256::from_le_bytes(rb2) % p;
+            dxs.push(dxv); dys.push(dyv);
+            for j in 0..n {
+                if dxv.bit(j) { *sim.qubit_mut(dx[j]) |= 1u64 << shot; }
+                if dyv.bit(j) { *sim.qubit_mut(dy[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let mut pass_pos = 0;
+        let mut pass_neg = 0;
+        for shot in 0..64 {
+            let exp_inv = classical_modinv(dxs[shot], p);
+            let exp_neg = if exp_inv.is_zero() { U256::ZERO } else { p.wrapping_sub(exp_inv) };
+            let mut got = U256::ZERO;
+            for j in 0..n {
+                if (sim.qubit(dx_inv[j]) >> shot) & 1 == 1 { got |= U256::from(1) << j; }
+            }
+            if got == exp_inv { pass_pos += 1; }
+            else if got == exp_neg { pass_neg += 1; }
+            else if shot < 2 { eprintln!("shot {}: got=0x{:x} exp+=0x{:x} exp-=0x{:x}", shot, got, exp_inv, exp_neg); }
+        }
+        let _ = tmp_ext;
+        eprintln!("dx^-1 recovery: pos={}/64 neg={}/64 total={}/64, phase=0x{:x}",
+            pass_pos, pass_neg, pass_pos + pass_neg, sim.global_phase());
+        assert_eq!(pass_pos + pass_neg, 64);
+    }
+
     /// Test computing c = dx · N where N = dy² - (Px+2Qx)·dx² mod p.
     /// c is the value to be inverted in the Montgomery batched approach.
     #[test]
