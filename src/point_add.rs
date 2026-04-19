@@ -3231,14 +3231,13 @@ fn kaliski_iteration_hrsl(
     let a_q = b.alloc_qubit();
     let b_q = b.alloc_qubit();
 
-    // STEP 0: update f via termination check. If v==0 and f=1, set f=0.
+    // STEP 0: update f via termination check.
     {
         let zero_flag = b.alloc_qubit();
         with_eq_zero_fast(b, v, zero_flag, |b| {
             b.ccx(f_flag, zero_flag, m_hist);
         });
         b.cx(m_hist, f_flag);
-        // Note: zero_flag uncomputed by with_eq_zero_fast.
         b.free(zero_flag);
     }
 
@@ -3462,7 +3461,7 @@ fn kaliski_iteration_hrsl_backward(
     // Reverse STEP 0: undo termination flag update
     {
         let zero_flag = b.alloc_qubit();
-        b.cx(m_hist, f_flag);  // undo f flip
+        b.cx(m_hist, f_flag);
         with_eq_zero_fast(b, v, zero_flag, |b| {
             b.ccx(f_flag, zero_flag, m_hist);
         });
