@@ -3506,7 +3506,7 @@ pub fn build() -> Vec<Op> {
     // quantum value (dx for pair 1, Rx-Ox for pair 2); their convergence
     // distributions may differ slightly. Boundaries verified empirically
     // against 9024 Fiat-Shamir shots.
-    const K1: usize = 2 * N - 111;  // pair 1 (invert dx) - expanded-scratch floor
+    const K1: usize = 2 * N - 112;  // pair 1 (invert dx) - new floor post op-stream shift
     const K2: usize = 2 * N - 111;  // pair 2 (invert Rx-Ox) - expanded-scratch floor
     // Per-pair STEP0_SKIP: maximum iter count below convergence for each pair.
     const STEP0_SKIP_1: usize = 241;
