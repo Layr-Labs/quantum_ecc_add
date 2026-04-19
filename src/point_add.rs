@@ -3215,10 +3215,7 @@ fn free_kaliski_state(b: &mut B, st: KaliskiState) {
 ///   - `st.r[..n]` holds the RAW Kaliski inverse `v^{-1} * 2^{2n} mod p`
 ///   - everything else in `st` is populated with deterministic iteration history
 ///
-/// HRSL-style Kaliski iteration: port of MS _MontBitGCDRound.
-/// Per-iter ~9n CCX (vs our ~11n) via direct controlled sub/add.
-/// IMPORTANT: a_q is allocated/freed WITHIN the iter (not persistent).
-/// m_hist[i] holds the per-iter decision bit. Uncompute via cx from r[0].
+/// HRSL-style Kaliski iteration: port of MS _MontBitGCDRound, with termination via f.
 fn kaliski_iteration_hrsl(
     b: &mut B,
     p: U256,
@@ -3227,21 +3224,39 @@ fn kaliski_iteration_hrsl(
     r: &[QubitId],
     s: &[QubitId],
     m_hist: QubitId,
+    f_flag: QubitId,
     _iter_idx: usize,
 ) {
     let n = u.len();
     let a_q = b.alloc_qubit();
     let b_q = b.alloc_qubit();
 
-    // STEP 1: a_q = (u is even) = NOT u[0]
+    // STEP 0: update f via termination check. If v==0 and f=1, set f=0.
+    {
+        let zero_flag = b.alloc_qubit();
+        with_eq_zero_fast(b, v, zero_flag, |b| {
+            b.ccx(f_flag, zero_flag, m_hist);
+        });
+        b.cx(m_hist, f_flag);
+        // Note: zero_flag uncomputed by with_eq_zero_fast.
+        b.free(zero_flag);
+    }
+
+    // STEP 1: a_q = f AND NOT u[0]  (so a_q=0 post-termination)
     b.x(u[0]);
-    b.cx(u[0], a_q);
+    b.ccx(f_flag, u[0], a_q);
     b.x(u[0]);
 
-    // STEP 2: m_hist ^= (v even AND u odd)
+    // STEP 2: m_hist ^= (f AND NOT v[0] AND NOT a_q)
     b.x(v[0]);
     b.x(a_q);
-    b.ccx(v[0], a_q, m_hist);
+    {
+        let tmp = b.alloc_qubit();
+        b.ccx(f_flag, v[0], tmp);     // tmp = f AND NOT v[0]
+        b.ccx(tmp, a_q, m_hist);       // m_hist ^= f AND v_even AND u_odd
+        b.ccx(f_flag, v[0], tmp);     // uncompute tmp
+        b.free(tmp);
+    }
     b.x(a_q);
     b.x(v[0]);
 
@@ -3249,12 +3264,18 @@ fn kaliski_iteration_hrsl(
     let carry = b.alloc_qubit();
     cmp_lt_into_fast(b, v, u, carry);
 
-    // STEP 4: tree of CNOTs + decision updates
+    // STEP 4: tree of CNOTs + decision updates (gated on f)
     b.cx(a_q, b_q);
     b.cx(m_hist, b_q);
     b.x(b_q);
-    b.ccx(carry, b_q, a_q);
-    b.ccx(carry, b_q, m_hist);
+    {
+        let fc = b.alloc_qubit();
+        b.ccx(f_flag, carry, fc);  // fc = f AND carry
+        b.ccx(fc, b_q, a_q);
+        b.ccx(fc, b_q, m_hist);
+        b.ccx(f_flag, carry, fc);  // uncompute fc
+        b.free(fc);
+    }
     b.x(b_q);
     b.cx(m_hist, b_q);
     b.cx(a_q, b_q);
@@ -3268,9 +3289,9 @@ fn kaliski_iteration_hrsl(
     // STEP 7: cswap(a_q, r, s)
     for i in 0..n { cswap(b, a_q, r[i], s[i]); }
 
-    // STEP 8: flip a_q for sub/add control
-    b.cx(m_hist, a_q);
-    b.x(a_q);
+    // STEP 8: flip a_q for sub/add control (gated on f)
+    b.ccx(f_flag, m_hist, a_q);
+    b.cx(f_flag, a_q);
 
     // STEP 9: v -= u controlled by a_q (via tmp register)
     {
@@ -3298,9 +3319,9 @@ fn kaliski_iteration_hrsl(
         b.free_vec(&tmp);
     }
 
-    // STEP 11: unflip a_q
-    b.x(a_q);
-    b.cx(m_hist, a_q);
+    // STEP 11: unflip a_q (gated on f)
+    b.cx(f_flag, a_q);
+    b.ccx(f_flag, m_hist, a_q);
 
     // STEP 12: halve v (shift right, v[0]=0 invariant after sub)
     for i in 0..(n - 1) { b.swap(v[i], v[i + 1]); }
@@ -3326,11 +3347,12 @@ fn kaliski_forward_hrsl(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256,
     for i in 0..n { if bit(p, i) { b.x(st.u[i]); } }
     for i in 0..n { b.cx(v_in[i], st.v_w[i]); }
     b.x(st.s[0]);
+    b.x(st.f_flag);  // f starts at 1
 
     for i in 0..iters {
         kaliski_iteration_hrsl(
             b, p, &st.u, &st.v_w, &st.r, &st.s,
-            st.m_hist[i], i,
+            st.m_hist[i], st.f_flag, i,
         );
     }
 }
@@ -3338,7 +3360,7 @@ fn kaliski_forward_hrsl(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256,
 /// HRSL-style backward: reverses kaliski_forward_hrsl exactly.
 fn kaliski_iteration_hrsl_backward(
     b: &mut B, p: U256, u: &[QubitId], v: &[QubitId], r: &[QubitId], s: &[QubitId],
-    m_hist: QubitId, _iter_idx: usize,
+    m_hist: QubitId, f_flag: QubitId, _iter_idx: usize,
 ) {
     let n = u.len();
     let a_q = b.alloc_qubit();
@@ -3357,9 +3379,9 @@ fn kaliski_iteration_hrsl_backward(
     // Reverse STEP 12: un-halve v (shift left)
     for i in (0..(n - 1)).rev() { b.swap(v[i], v[i + 1]); }
 
-    // Reverse STEP 11: flip a_q
-    b.cx(m_hist, a_q);
-    b.x(a_q);
+    // Reverse STEP 11: flip a_q (gated on f)
+    b.ccx(f_flag, m_hist, a_q);
+    b.cx(f_flag, a_q);
 
     // Reverse STEP 10: s -= r controlled
     {
@@ -3387,9 +3409,9 @@ fn kaliski_iteration_hrsl_backward(
         b.free_vec(&tmp);
     }
 
-    // Reverse STEP 8: unflip a_q
-    b.x(a_q);
-    b.cx(m_hist, a_q);
+    // Reverse STEP 8: unflip a_q (gated on f)
+    b.cx(f_flag, a_q);
+    b.ccx(f_flag, m_hist, a_q);
 
     // Reverse STEP 7, 6: cswap
     for i in 0..n { cswap(b, a_q, r[i], s[i]); }
@@ -3399,12 +3421,18 @@ fn kaliski_iteration_hrsl_backward(
     let carry = b.alloc_qubit();
     cmp_lt_into_fast(b, v, u, carry);
 
-    // Reverse STEP 4: tree of CNOTs (self-inverse)
+    // Reverse STEP 4: tree of CNOTs (gated on f)
     b.cx(a_q, b_q);
     b.cx(m_hist, b_q);
     b.x(b_q);
-    b.ccx(carry, b_q, m_hist);
-    b.ccx(carry, b_q, a_q);
+    {
+        let fc = b.alloc_qubit();
+        b.ccx(f_flag, carry, fc);
+        b.ccx(fc, b_q, m_hist);
+        b.ccx(fc, b_q, a_q);
+        b.ccx(f_flag, carry, fc);
+        b.free(fc);
+    }
     b.x(b_q);
     b.cx(m_hist, b_q);
     b.cx(a_q, b_q);
@@ -3413,17 +3441,33 @@ fn kaliski_iteration_hrsl_backward(
     cmp_lt_into_fast(b, v, u, carry);
     b.free(carry);
 
-    // Reverse STEP 2: un-XOR m_hist
+    // Reverse STEP 2: un-XOR m_hist (gated on f)
     b.x(v[0]);
     b.x(a_q);
-    b.ccx(v[0], a_q, m_hist);
+    {
+        let tmp = b.alloc_qubit();
+        b.ccx(f_flag, v[0], tmp);
+        b.ccx(tmp, a_q, m_hist);
+        b.ccx(f_flag, v[0], tmp);
+        b.free(tmp);
+    }
     b.x(a_q);
     b.x(v[0]);
 
-    // Reverse STEP 1: uncompute a_q
+    // Reverse STEP 1: uncompute a_q (new: a_q = f AND NOT u[0])
     b.x(u[0]);
-    b.cx(u[0], a_q);
+    b.ccx(f_flag, u[0], a_q);
     b.x(u[0]);
+
+    // Reverse STEP 0: undo termination flag update
+    {
+        let zero_flag = b.alloc_qubit();
+        b.cx(m_hist, f_flag);  // undo f flip
+        with_eq_zero_fast(b, v, zero_flag, |b| {
+            b.ccx(f_flag, zero_flag, m_hist);
+        });
+        b.free(zero_flag);
+    }
 
     b.free(b_q);
     b.free(a_q);
@@ -3434,10 +3478,11 @@ fn kaliski_backward_hrsl(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256
     for i in (0..iters).rev() {
         kaliski_iteration_hrsl_backward(
             b, p, &st.u, &st.v_w, &st.r, &st.s,
-            st.m_hist[i], i,
+            st.m_hist[i], st.f_flag, i,
         );
     }
     // Reverse init
+    b.x(st.f_flag);
     b.x(st.s[0]);
     for i in 0..n { b.cx(v_in[i], st.v_w[i]); }
     for i in 0..n { if bit(p, i) { b.x(st.u[i]); } }
@@ -4020,7 +4065,7 @@ pub fn build() -> Vec<Op> {
     // quantum value (dx for pair 1, Rx-Ox for pair 2); their convergence
     // distributions may differ slightly. Boundaries verified empirically
     // against 9024 Fiat-Shamir shots.
-    const K1: usize = 2 * N - 1;    // HRSL experiment: safety max
+    const K1: usize = 2 * N - 1;    // HRSL WIP: safety max while debugging termination
     const K2: usize = 2 * N - 111;  // pair 2 unchanged
     // Per-pair STEP0_SKIP: maximum iter count below convergence for each pair.
     const STEP0_SKIP_1: usize = 241;
@@ -4032,8 +4077,8 @@ pub fn build() -> Vec<Op> {
 
     let lam = b.alloc_qubits(N);
 
-    // Pair 1: HRSL experiment — use kaliski_forward_hrsl/backward_hrsl.
-    let _ = STEP0_SKIP_1;  // unused in HRSL variant
+    // Pair 1: HRSL wired with WIP termination.
+    let _ = STEP0_SKIP_1;
     with_kal_inv_hrsl(b, &tx, p, K1, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
@@ -4147,7 +4192,7 @@ mod tests {
         let p = U256::from_str_radix(
             "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
         ).unwrap();
-        let iters = 259;
+        let iters = 300;
         let n = 256;
 
         let b = &mut B::new();
