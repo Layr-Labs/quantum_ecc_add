@@ -3113,8 +3113,32 @@ fn kaliski_iteration_backward(
     for j in (0..uv_width).rev() { cswap(b, a_f, u[j], v_w[j]); }
 
     // ── Reverse STEP 2 (with_gt body is self-inverse) ──────────────────
+    // Iter 0: after reverse-STEP-3 (un-swap), u=p and v_w=v_in; l_gt=1 always.
     let cmp_width = if iter_idx < n { n } else { 2 * n - iter_idx - 1 };
     let l_gt = b.alloc_qubit();
+    if iter_idx == 0 {
+        b.x(l_gt);
+        b.x(b_f);
+        b.ccx(f, l_gt, add_f);
+        let t = b.alloc_qubit();
+        b.ccx(add_f, b_f, t);
+        b.cx(t, m_i);
+        b.cx(t, a_f);
+        {
+            let tm = b.alloc_bit();
+            b.hmr(t, tm);
+            b.cz_if(add_f, b_f, tm);
+        }
+        b.free(t);
+        {
+            let am = b.alloc_bit();
+            b.hmr(add_f, am);
+            b.cz_if(f, l_gt, am);
+        }
+        b.x(b_f);
+        b.x(l_gt);
+        b.free(l_gt);
+    } else {
     with_gt(b, &u[0..cmp_width], &v_w[0..cmp_width], l_gt, |b| {
         b.x(b_f);
         b.ccx(f, l_gt, add_f);
@@ -3139,6 +3163,7 @@ fn kaliski_iteration_backward(
         b.x(b_f);
     });
     b.free(l_gt);
+    }
 
     // ── Reverse STEP 1 ─────────────────────────────────────────────────
     b.cx(m_i, b_f);
