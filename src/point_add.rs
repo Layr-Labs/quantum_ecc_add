@@ -4205,7 +4205,7 @@ pub fn build() -> Vec<Op> {
         mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_ext);
         for _ in 0..K2 { mod_double_inplace_fast(b, &lam, p); }
         mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &lam, inv_raw, &ty, p, &tmp_ext);
-        mod_sub_qb(b, &ty, &oy, p);                      // ty = (Ry+Qy) - Qy = Ry
+        mod_sub_qb(b, &ty, &oy, p);
         b.free_vec(&tmp_lo);
     });
     mod_add_qb(b, &tx, &ox, p);                           // tx = Rx
