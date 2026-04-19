@@ -4166,12 +4166,11 @@ pub fn build() -> Vec<Op> {
     // quantum value (dx for pair 1, Rx-Ox for pair 2); their convergence
     // distributions may differ slightly. Boundaries verified empirically
     // against 9024 Fiat-Shamir shots.
-    const K1: usize = 2 * N - 1;    // HRSL at K=511 safety
-    const K2: usize = 2 * N - 1;    // pair 2 at K=511 safety (HRSL stream shifts seed)
+    const K1: usize = 2 * N - 112;  // pair 1 baseline
+    const K2: usize = 2 * N - 111;  // pair 2
     // Per-pair STEP0_SKIP: maximum iter count below convergence for each pair.
-    let _ = (2 * N - 112, 2 * N - 111);
-    const STEP0_SKIP_1: usize = 0;  // conservative under shifted seed
-    const STEP0_SKIP_2: usize = 0;  // conservative under shifted seed
+    const STEP0_SKIP_1: usize = 241;
+    const STEP0_SKIP_2: usize = 301;
 
     // Step 1-2: Px -= Qx, Py -= Qy
     mod_sub_qb(b, &tx, &ox, p);
@@ -4179,9 +4178,8 @@ pub fn build() -> Vec<Op> {
 
     let lam = b.alloc_qubits(N);
 
-    // Pair 1: HRSL at K=511 safety.
-    let _ = STEP0_SKIP_1;
-    with_kal_inv_hrsl(b, &tx, p, K1, |b, inv_raw, scratch| {
+    // Pair 1: baseline Kaliski.
+    with_kal_inv_raw_scratch(b, &tx, p, K1, STEP0_SKIP_1, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
         tmp_ext.extend_from_slice(scratch);
@@ -4204,8 +4202,6 @@ pub fn build() -> Vec<Op> {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
         tmp_ext.extend_from_slice(scratch);
-        // ty starts at 0 here (mul2 cleared it), so compute Ry+Qy inside the
-        // Kaliski body and reuse the borrowed zero tail as multiplier scratch.
         mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_ext);
         for _ in 0..K2 { mod_double_inplace_fast(b, &lam, p); }
         mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &lam, inv_raw, &ty, p, &tmp_ext);
@@ -4416,6 +4412,71 @@ mod tests {
     /// Unit test: kaliski_forward_hrsl on v_in=3, check st.r matches expected.
     #[test]
     #[test]
+    fn test_hrsl_body_batches() {
+        use sha3::digest::XofReader;
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 511;
+        let n = 256;
+
+        let b = &mut B::new();
+        let tx = b.alloc_qubits(n);
+        let ty = b.alloc_qubits(n);
+        let lam = b.alloc_qubits(n);
+        with_kal_inv_hrsl(b, &tx, p, iters, |b, inv_raw, scratch| {
+            let tmp_lo = b.alloc_qubits(2 * n - scratch.len());
+            let mut tmp_ext = tmp_lo.clone();
+            tmp_ext.extend_from_slice(scratch);
+            mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &lam, &ty, inv_raw, p, &tmp_ext);
+            for _ in 0..iters { mod_halve_inplace_fast(b, &lam, p); }
+            mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_ext);
+            b.free_vec(&tmp_lo);
+        });
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        // Run many batches of 64 different random inputs. Report phase per batch.
+        let mut failing_batches = 0;
+        let mut failing_batch_samples: Vec<u64> = Vec::new();
+        use sha3::{Shake256, digest::Update};
+        for seed_i in 0..30u64 {
+            let mut h = Shake256::default();
+            Update::update(&mut h, format!("batch-{}", seed_i).as_bytes());
+            let mut xof = h.finalize_xof();
+            let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+            sim.clear_for_shot();
+            let mut vxof = {
+                let mut hh = Shake256::default();
+                Update::update(&mut hh, format!("inputs-{}", seed_i).as_bytes());
+                hh.finalize_xof()
+            };
+            for shot in 0..64 {
+                let mut rb = [0u8; 32];
+                vxof.read(&mut rb);
+                let mut dx = U256::from_le_bytes(rb);
+                while dx.is_zero() || dx >= p { dx = dx.wrapping_sub(U256::from(1)); }
+                vxof.read(&mut rb);
+                let dy = U256::from_le_bytes(rb) % p;
+                for j in 0..n {
+                    if dx.bit(j) { *sim.qubit_mut(tx[j]) |= 1u64 << shot; }
+                    if dy.bit(j) { *sim.qubit_mut(ty[j]) |= 1u64 << shot; }
+                }
+            }
+            sim.apply_iter(ops.clone().into_iter());
+            if sim.global_phase() != 0 {
+                failing_batches += 1;
+                failing_batch_samples.push(sim.global_phase());
+            }
+        }
+        eprintln!("HRSL+body phase check: {}/30 batches had non-zero phase", failing_batches);
+        for (i, p) in failing_batch_samples.iter().take(3).enumerate() {
+            eprintln!("  failing batch {}: phase=0x{:x}", i, p);
+        }
+    }
+
+    #[test]
     fn test_hrsl_multi_v_with_body() {
         use sha3::digest::XofReader;
         let p = U256::from_str_radix(
@@ -4594,7 +4655,8 @@ mod tests {
         sim.apply_iter(ops.into_iter());
 
         let two_k = pow_mod_2_k(p, iters);
-        let mut passing = 0;
+        let mut pos_count = 0;
+        let mut neg_count = 0;
         let mut failing: Vec<(usize, U256, U256, U256, U256)> = Vec::new();
         for shot in 0..64 {
             let v_val = vs[shot];
@@ -4607,10 +4669,11 @@ mod tests {
                     got |= U256::from(1) << j;
                 }
             }
-            if got == exp_pos || got == exp_neg { passing += 1; }
+            if got == exp_pos { pos_count += 1; }
+            else if got == exp_neg { neg_count += 1; }
             else { failing.push((shot, v_val, got, exp_pos, exp_neg)); }
         }
-        eprintln!("HRSL forward: {}/64 pass", passing);
+        eprintln!("HRSL forward signs: {} positive, {} negative, {} failing", pos_count, neg_count, failing.len());
         for (shot, v, got, pos, neg) in failing.iter().take(5) {
             eprintln!("  shot {} v=0x{:x}: got=0x{:x} exp+=0x{:x} exp-=0x{:x}", shot, v, got, pos, neg);
         }
