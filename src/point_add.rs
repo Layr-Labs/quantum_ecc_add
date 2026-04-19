@@ -503,9 +503,6 @@ fn qrom_lookup(b: &mut B, table: &[U256], addr: &[QubitId], out: &[QubitId]) {
     //
     // Start with flat for simplicity; optimize in subsequent iterations.
     let n_entries = 1usize << w;
-    // Allocate w flag qubits for "addr == i" check, constructed via
-    // nested AND tree. For the first iteration, use a simple but
-    // suboptimal per-entry AND.
     for i in 0..n_entries {
         // Flip addr bits that are 0 in i (so that AND = 1 when addr == i).
         for k in 0..w {
@@ -513,21 +510,30 @@ fn qrom_lookup(b: &mut B, table: &[U256], addr: &[QubitId], out: &[QubitId]) {
                 b.x(addr[k]);
             }
         }
-        // Compute the AND of all addr bits into a scratch qubit.
-        let scratch = b.alloc_qubit();
-        // Fold via ccx tree. For w=1: just cx(addr[0], scratch).
-        // For w>=2: ccx(addr[0], addr[1], scratch); then ccx with each subsequent.
+        // Build the AND-tree. For w=1, the "AND" is just addr[0] itself —
+        // use it directly as the scratch control.
         if w == 1 {
-            b.cx(addr[0], scratch);
+            // XOR T[i] bits into out, controlled by addr[0].
+            for j in 0..m {
+                if bit(table[i], j) {
+                    b.cx(addr[0], out[j]);
+                }
+            }
         } else {
-            // Build w-1 intermediate qubits.
+            // w >= 2: compute ANDs into w-1 ancillae.
             let ands = b.alloc_qubits(w - 1);
             b.ccx(addr[0], addr[1], ands[0]);
             for k in 1..(w - 1) {
                 b.ccx(ands[k - 1], addr[k + 1], ands[k]);
             }
-            b.cx(ands[w - 2], scratch);
-            // Uncompute ands.
+            // The top AND is in ands[w-2] — this represents (addr == i).
+            // XOR T[i] bits into out, controlled by this top AND.
+            for j in 0..m {
+                if bit(table[i], j) {
+                    b.cx(ands[w - 2], out[j]);
+                }
+            }
+            // Uncompute ands via HMR (Gidney AND uncompute).
             for k in (1..(w - 1)).rev() {
                 let m_bit = b.alloc_bit();
                 b.hmr(ands[k], m_bit);
@@ -538,44 +544,6 @@ fn qrom_lookup(b: &mut B, table: &[U256], addr: &[QubitId], out: &[QubitId]) {
             b.cz_if(addr[0], addr[1], m_bit);
             b.free_vec(&ands);
         }
-        // XOR T[i] bits into out, controlled by scratch.
-        for j in 0..m {
-            if bit(table[i], j) {
-                b.cx(scratch, out[j]);
-            }
-        }
-        // Uncompute scratch.
-        if w == 1 {
-            b.cx(addr[0], scratch);
-        } else {
-            // Measurement-based uncompute.
-            let m_bit = b.alloc_bit();
-            b.hmr(scratch, m_bit);
-            // Phase correction is tricky for scratch since it's derived
-            // from the ands chain via cx(ands[w-2], scratch). The CX path
-            // doesn't have a clean HMR uncompute. For now, re-run the
-            // AND-chain compute in reverse to zero scratch.
-            let ands = b.alloc_qubits(w - 1);
-            b.ccx(addr[0], addr[1], ands[0]);
-            for k in 1..(w - 1) {
-                b.ccx(ands[k - 1], addr[k + 1], ands[k]);
-            }
-            // CX-based uncompute of scratch. scratch = 0 after.
-            // Actually: scratch currently = original AND-value XOR random (from HMR).
-            // We've lost its original value. This path is incorrect for now —
-            // needs proper Gidney AND+HMR structure.
-            let _ = m_bit;
-            for k in (1..(w - 1)).rev() {
-                let m2 = b.alloc_bit();
-                b.hmr(ands[k], m2);
-                b.cz_if(ands[k - 1], addr[k + 1], m2);
-            }
-            let m2 = b.alloc_bit();
-            b.hmr(ands[0], m2);
-            b.cz_if(addr[0], addr[1], m2);
-            b.free_vec(&ands);
-        }
-        b.free(scratch);
         // Restore addr bits that were flipped.
         for k in 0..w {
             if (i >> k) & 1 == 0 {

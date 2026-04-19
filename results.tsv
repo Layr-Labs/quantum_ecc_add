@@ -485,3 +485,4 @@ timestamp	commit	toffoli	clifford	qubits	ops	correct	notes
 1776575524	80e9022	4351164.000	22315498.998	2997	29798803	OK	end session verify baseline
 1776575755	e02f6ab	30198.922	156611.940	2997	28498287	FAIL	remove STEP 0 OR chain entirely (experimental) | CLASSICAL MISMATCH shot 57: got (0xf9d0f8cba7e27e6f41780a86a91b363ef2a19f47201bd630688a55293bc591d1,0x927eaba7552716f6423bd13f7520bfdad2fe38269a71351df6d46c71cb1bfd47) exp (0x38e34945edb29c30a8ccd0dd536e3a2f344dffead30bd5a0ae2e3896a5d7662b,0x389db9a0775d28d88ab1ab114c094829395d80a6c07e92c9dc80f134f8d200ef)
 1776576062	bc2d2b1	4351164.000	22315498.998	2997	29798803	OK	add unused QROM lookup primitive (infrastructure)
+1776576195	0814886	4351164.000	22315498.998	2997	29798803	OK	QROM primitive cleaned up (unused but correct)
