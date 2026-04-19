@@ -4588,6 +4588,36 @@ mod tests {
             }
         }
         let _ = tmp_ext;
+        // Count CCX ops in the circuit to estimate Toffoli cost.
+        let mut ccx_count = 0;
+        let mut ccz_count = 0;
+        let mut total_ops = 0;
+        let b2 = &mut B::new();
+        let dx2 = b2.alloc_qubits(n); let dy2 = b2.alloc_qubits(n);
+        let n_reg2 = b2.alloc_qubits(n); let c_reg2 = b2.alloc_qubits(n);
+        let dx_inv2 = b2.alloc_qubits(n); let rqx_inv2 = b2.alloc_qubits(n);
+        let dx_cube2 = b2.alloc_qubits(n); let dx_sq2 = b2.alloc_qubits(n);
+        let tmp_ext2 = b2.alloc_qubits(2 * n);
+        compute_montgomery_n(b2, &dx2, &dy2, px_val, qx_val, &n_reg2, p);
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b2, &c_reg2, &dx2, &n_reg2, p, &tmp_ext2);
+        squaring_add_to_acc_schoolbook(b2, &dx_sq2, &dx2, p);
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b2, &dx_cube2, &dx_sq2, &dx2, p, &tmp_ext2);
+        with_kal_inv_raw(b2, &c_reg2, p, K, 0, |b, c_inv_raw| {
+            mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &dx_inv2, c_inv_raw, &n_reg2, p, &tmp_ext2);
+            for _ in 0..K { mod_halve_inplace_fast(b, &dx_inv2, p); }
+            mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &rqx_inv2, c_inv_raw, &dx_cube2, p, &tmp_ext2);
+            for _ in 0..K { mod_halve_inplace_fast(b, &rqx_inv2, p); }
+        });
+        for op in b2.ops.iter() {
+            total_ops += 1;
+            match op.kind {
+                OperationType::CCX => ccx_count += 1,
+                OperationType::CCZ => ccz_count += 1,
+                _ => {}
+            }
+        }
+        eprintln!("Montgomery forward chain CCX+CCZ = {} + {} = {}, total ops = {}, qubits = {}",
+            ccx_count, ccz_count, ccx_count + ccz_count, total_ops, b2.next_qubit);
         eprintln!("dx^-1: {}/64, (Rx-Qx)^-1: {}/64, phase=0x{:x}",
             dx_inv_ok, rqx_inv_ok, sim.global_phase());
         assert!(dx_inv_ok >= 60, "dx_inv recovery failed");
