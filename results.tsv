@@ -512,3 +512,4 @@ timestamp	commit	toffoli	clifford	qubits	ops	correct	notes
 1776586714	5fea7fc	2225386.468	11509867.264	3306	32463755	FAIL	pair 1 windowed mul + K1=480 probe | PHASE GARBAGE: global_phase = 0x0000000000000002 across 64 live shots (must be 0)
 1776586781	5fea7fc	4351164.000	22315498.998	2997	29798803	OK	baseline confirm post-revert
 1776587235	e9b527d	4351164.000	22315498.998	2997	29798803	OK	baseline confirm iter 4
+1776588101	6b451f1	4351164.000	22315498.998	2997	29798803	OK	add wide-acc windowed mul infra (dead code; no build() change)

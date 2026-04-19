@@ -2988,6 +2988,53 @@ fn mul_by_const_acc(
     b.free_vec(&tmp);
 }
 
+/// Wide-accumulator version of mul_by_const_acc_windowed — defers mod-p reduction.
+/// acc_wide has n + pad bits; 0 on entry. On exit, acc_wide holds x × c as integer
+/// (may exceed p, but < 64p for n_windows=64 and each table entry < p, so pad >= 7 suffices).
+/// Cost per window: 48 QROM + (n+pad) raw add + 48 QROM_uncompute ≈ 360 CCX.
+/// Over 64 windows: 23K CCX. Caller must do final Solinas reduction separately.
+#[allow(dead_code)]
+fn mul_by_const_acc_windowed_wide(
+    b: &mut B,
+    x: &[QubitId],
+    c: U256,
+    acc_wide: &[QubitId],
+    p: U256,
+    subtract: bool,
+) {
+    let n = x.len();
+    let w = 4usize;
+    debug_assert_eq!(n % w, 0);
+    if c == U256::ZERO { return; }
+    let wide = acc_wide.len();
+    let pad_bits = wide - n;
+    let tmp = b.alloc_qubits(n);
+    let n_windows = n / w;
+    for wi in 0..n_windows {
+        let window_pos = wi * w;
+        let two_pos = pow_mod_2_k(p, window_pos);
+        let c_pos = mulmod(c, two_pos, p);
+        let mut table: Vec<U256> = Vec::with_capacity(1 << w);
+        for j in 0..(1u64 << w) {
+            table.push(mulmod(U256::from(j), c_pos, p));
+        }
+        let addr: Vec<QubitId> = x[window_pos..window_pos + w].to_vec();
+        qrom_lookup(b, &table, &addr, &tmp);
+        // Zero-pad tmp to wide length, then add to acc_wide.
+        let pad = b.alloc_qubits(pad_bits);
+        let mut tmp_padded: Vec<QubitId> = tmp.clone();
+        tmp_padded.extend_from_slice(&pad);
+        if subtract {
+            sub_nbit_qq_fast(b, &tmp_padded, acc_wide);
+        } else {
+            add_nbit_qq_fast(b, &tmp_padded, acc_wide);
+        }
+        b.free_vec(&pad);
+        qrom_lookup(b, &table, &addr, &tmp);
+    }
+    b.free_vec(&tmp);
+}
+
 /// Windowed version of mul_by_const_acc using QROM lookups.
 /// For each w-bit window of x, lookup (window_val * c * 2^pos) mod p from a
 /// 2^w-entry classical table and add (or subtract) into acc.
