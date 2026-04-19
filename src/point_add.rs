@@ -2199,11 +2199,125 @@ fn schoolbook_square_symmetric_inverse(b: &mut B, x: &[QubitId], tmp_ext: &[Qubi
     }
 }
 
-/// Schoolbook squarer with Bennett uncompute. For squaring `tmp_ext = x*x`
-/// (2n bits, no mod reduction), then sub from acc with on-the-fly Solinas
-/// reduction, then uncompute tmp_ext via gate-level inverse. Saves ~170k
-/// CCX vs walk-x squaring (459k → 289k) by avoiding 256 expensive
-/// cmod_add_qq calls (each 5n) in favor of 2n²=131k of cheap AND+Cuccaro.
+/// Karatsuba squaring: tmp_ext (2n) += x². Uses 3 (n/2)-bit sub-squarings
+/// via schoolbook_square_symmetric. Cost: 3·(n/2)²/2 = 3n²/8 vs schoolbook
+/// n²/2, saving n²/8 = ~8K CCX per call for n=256.
+#[allow(dead_code)]
+fn karatsuba_square_forward(
+    b: &mut B,
+    x: &[QubitId],
+    tmp_ext: &[QubitId],
+    z1_reg: &[QubitId],
+) {
+    let n = x.len();
+    let h = n / 2;
+    debug_assert_eq!(tmp_ext.len(), 2 * n);
+    debug_assert_eq!(z1_reg.len(), 2 * (h + 1));
+    let x_lo: Vec<QubitId> = x[0..h].to_vec();
+    let x_hi: Vec<QubitId> = x[h..n].to_vec();
+
+    // A: tmp_ext[0..2h] += x_lo² (= z0).
+    {
+        let slice: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
+        schoolbook_square_symmetric(b, &x_lo, &slice);
+    }
+    // B: tmp_ext[2h..4h] += x_hi² (= z2).
+    {
+        let slice: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
+        schoolbook_square_symmetric(b, &x_hi, &slice);
+    }
+    // C: z_sum = x_lo + x_hi (h+1 bits).
+    let z_sum = b.alloc_qubits(h + 1);
+    karatsuba_half_sum_compute(b, &x_lo, &x_hi, &z_sum);
+    // D: z1_reg = z_sum² (2(h+1) bits).
+    schoolbook_square_symmetric(b, &z_sum, z1_reg);
+    // Free z_sum.
+    karatsuba_half_sum_uncompute(b, &x_lo, &x_hi, &z_sum);
+    b.free_vec(&z_sum);
+    // E: z1_reg -= z0.
+    {
+        let pad = b.alloc_qubits(2);
+        let mut z0_ext: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
+        z0_ext.extend_from_slice(&pad);
+        sub_nbit_qq_fast(b, &z0_ext, z1_reg);
+        b.free_vec(&pad);
+    }
+    // F: z1_reg -= z2.
+    {
+        let pad = b.alloc_qubits(2);
+        let mut z2_ext: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
+        z2_ext.extend_from_slice(&pad);
+        sub_nbit_qq_fast(b, &z2_ext, z1_reg);
+        b.free_vec(&pad);
+    }
+    // G: tmp_ext[h..4h] += z1_reg (zero-padded to 3h bits).
+    {
+        let pad = b.alloc_qubits(3*h - 2*(h+1));
+        let mut z1_ext: Vec<QubitId> = z1_reg.to_vec();
+        z1_ext.extend_from_slice(&pad);
+        let acc_slice: Vec<QubitId> = tmp_ext[h..4*h].to_vec();
+        add_nbit_qq_fast(b, &z1_ext, &acc_slice);
+        b.free_vec(&pad);
+    }
+}
+
+/// Inverse of karatsuba_square_forward: zeros tmp_ext.
+#[allow(dead_code)]
+fn karatsuba_square_inverse(
+    b: &mut B,
+    x: &[QubitId],
+    tmp_ext: &[QubitId],
+    z1_reg: &[QubitId],
+) {
+    let n = x.len();
+    let h = n / 2;
+    let x_lo: Vec<QubitId> = x[0..h].to_vec();
+    let x_hi: Vec<QubitId> = x[h..n].to_vec();
+
+    // Reverse G: tmp_ext[h..4h] -= z1_reg.
+    {
+        let pad = b.alloc_qubits(3*h - 2*(h+1));
+        let mut z1_ext: Vec<QubitId> = z1_reg.to_vec();
+        z1_ext.extend_from_slice(&pad);
+        let acc_slice: Vec<QubitId> = tmp_ext[h..4*h].to_vec();
+        sub_nbit_qq_fast(b, &z1_ext, &acc_slice);
+        b.free_vec(&pad);
+    }
+    // Reverse F: z1_reg += z2.
+    {
+        let pad = b.alloc_qubits(2);
+        let mut z2_ext: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
+        z2_ext.extend_from_slice(&pad);
+        add_nbit_qq_fast(b, &z2_ext, z1_reg);
+        b.free_vec(&pad);
+    }
+    // Reverse E: z1_reg += z0.
+    {
+        let pad = b.alloc_qubits(2);
+        let mut z0_ext: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
+        z0_ext.extend_from_slice(&pad);
+        add_nbit_qq_fast(b, &z0_ext, z1_reg);
+        b.free_vec(&pad);
+    }
+    // Reverse D: z1_reg -= z_sum².
+    let z_sum = b.alloc_qubits(h + 1);
+    karatsuba_half_sum_compute(b, &x_lo, &x_hi, &z_sum);
+    schoolbook_square_symmetric_inverse(b, &z_sum, z1_reg);
+    karatsuba_half_sum_uncompute(b, &x_lo, &x_hi, &z_sum);
+    b.free_vec(&z_sum);
+    // Reverse B: tmp_ext[2h..4h] -= x_hi².
+    {
+        let slice: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
+        schoolbook_square_symmetric_inverse(b, &x_hi, &slice);
+    }
+    // Reverse A: tmp_ext[0..2h] -= x_lo².
+    {
+        let slice: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
+        schoolbook_square_symmetric_inverse(b, &x_lo, &slice);
+    }
+}
+
+/// Schoolbook squarer with Bennett uncompute.
 fn squaring_sub_from_acc_schoolbook(
     b: &mut B,
     acc: &[QubitId],
@@ -2216,7 +2330,7 @@ fn squaring_sub_from_acc_schoolbook(
     let tmp_ext = b.alloc_qubits(2 * n);
     let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
 
-    // Phase 1: symmetric schoolbook tmp_ext = x*x (~half the CCX of full).
+    // Phase 1: symmetric schoolbook tmp_ext = x*x.
     schoolbook_square_symmetric(b, x, &tmp_ext);
 
     // Phase 2: subtract (lo + hi*c mod p) from acc.
@@ -4168,7 +4282,6 @@ pub fn build() -> Vec<Op> {
     // against 9024 Fiat-Shamir shots.
     const K1: usize = 2 * N - 112;  // pair 1 baseline
     const K2: usize = 2 * N - 111;  // pair 2
-    // Per-pair STEP0_SKIP: maximum iter count below convergence for each pair.
     const STEP0_SKIP_1: usize = 241;
     const STEP0_SKIP_2: usize = 301;
 
@@ -4226,6 +4339,89 @@ mod tests {
         let mut h = Shake256::default();
         Update::update(&mut h, b"test-qrom");
         h.finalize_xof()
+    }
+
+    #[test]
+    fn test_karatsuba_square_forward() {
+        let n = 256usize;
+        let h = n / 2;
+
+        let b = &mut B::new();
+        let x = b.alloc_qubits(n);
+        let tmp_ext = b.alloc_qubits(2 * n);
+        let z1_reg = b.alloc_qubits(2 * (h + 1));
+        karatsuba_square_forward(b, &x, &tmp_ext, &z1_reg);
+        let ops = b.ops.clone();
+        let nq = b.next_qubit;
+        let nb = b.next_bit;
+
+        // Test: x = some random 256-bit value. Expect tmp_ext = x² mod 2^(2n).
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof);
+        sim.clear_for_shot();
+
+        use sha3::digest::XofReader;
+        let mut vxof = make_xof();
+        let mut dxs: Vec<U256> = Vec::with_capacity(64);
+        for shot in 0..64 {
+            let mut rb = [0u8; 32];
+            vxof.read(&mut rb);
+            let val = U256::from_le_bytes(rb);
+            dxs.push(val);
+            for j in 0..n {
+                if val.bit(j) { *sim.qubit_mut(x[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let mut pass = 0;
+        for shot in 0..64 {
+            // Expected: x² as 2n-bit integer = (x·x) mod 2^512.
+            // We'll check low 2n bits.
+            let v = dxs[shot];
+            let (lo, hi) = {
+                // Compute v*v using 512-bit math manually.
+                // Use alloy's U256 by doing split mul.
+                let mut prod_lo = U256::ZERO;
+                let mut prod_hi = U256::ZERO;
+                // Schoolbook in bits.
+                for i in 0..n {
+                    if v.bit(i) {
+                        // Add (v << i) to prod.
+                        for j in 0..n {
+                            if v.bit(j) {
+                                let pos = i + j;
+                                if pos < n {
+                                    let delta = U256::from(1) << pos;
+                                    let old = prod_lo;
+                                    prod_lo = prod_lo.wrapping_add(delta);
+                                    if prod_lo < old { prod_hi = prod_hi.wrapping_add(U256::from(1)); }
+                                } else {
+                                    let delta = U256::from(1) << (pos - n);
+                                    prod_hi = prod_hi.wrapping_add(delta);
+                                }
+                            }
+                        }
+                    }
+                }
+                (prod_lo, prod_hi)
+            };
+            let mut got_lo = U256::ZERO;
+            let mut got_hi = U256::ZERO;
+            for j in 0..n {
+                if (sim.qubit(tmp_ext[j]) >> shot) & 1 == 1 { got_lo |= U256::from(1) << j; }
+                if (sim.qubit(tmp_ext[n + j]) >> shot) & 1 == 1 { got_hi |= U256::from(1) << j; }
+            }
+            if got_lo == lo && got_hi == hi {
+                pass += 1;
+            } else if shot < 3 {
+                eprintln!("shot {}: v=0x{:x}", shot, v);
+                eprintln!("  got_lo=0x{:x} exp_lo=0x{:x}", got_lo, lo);
+                eprintln!("  got_hi=0x{:x} exp_hi=0x{:x}", got_hi, hi);
+            }
+        }
+        eprintln!("Karatsuba square: {}/64 pass", pass);
+        eprintln!("global_phase = 0x{:x}", sim.global_phase());
     }
 
     #[test]
