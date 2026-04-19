@@ -3313,8 +3313,13 @@ fn kaliski_iteration_hrsl(
     // STEP 15: cswap back (r, s)
     for i in 0..n { cswap(b, a_q, r[i], s[i]); }
 
-    // STEP 16: uncompute a_q via r[0] parity
-    b.cx(r[0], a_q);
+    // STEP 16: uncompute a_q via HMR + phase-correct. If invariant a_q==r[0] holds,
+    // this is phase-neutral. If not, phase garbage will appear.
+    {
+        let m = b.alloc_bit();
+        b.hmr(a_q, m);
+        b.z_if(r[0], m);
+    }
 
     b.free(b_q);
     b.free(a_q);

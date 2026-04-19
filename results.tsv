@@ -532,3 +532,4 @@ timestamp	commit	toffoli	clifford	qubits	ops	correct	notes
 1776594414	aa799c0	4351164.000	22315496.431	2997	29798803	OK	mod_sub_qb order swap only: test if passes at K=400
 1776594590	4d1d91f	4351164.000	22315496.431	2997	29798803	OK	baseline confirm iter 33
 1776595039	4d1d91f	40280.816	213752.427	3107	39548011	FAIL	HRSL kaliski_iteration_hrsl wired into pair 1 + K1=511 safety | PHASE GARBAGE: global_phase = 0xa79bdd08dce27898 across 64 live shots (must be 0)
+1776595221	7676281	40280.816	213753.377	3107	39548522	FAIL	HRSL: STEP 16 via HMR+cz_if(r[0]) | PHASE GARBAGE: global_phase = 0x534d061c7a4b829d across 64 live shots (must be 0)
