@@ -4256,6 +4256,103 @@ mod tests {
         eprintln!("phase = 0x{:x}", phase);
     }
 
+    /// Varied inputs per shot, forward+backward only (no body).
+    #[test]
+    fn test_hrsl_varied_shots_no_body() {
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 511;
+        let n = 256;
+
+        let b = &mut B::new();
+        let v_in = b.alloc_qubits(n);
+        let st = alloc_kaliski_state(b, n, iters);
+        kaliski_forward_hrsl(b, &v_in, &st, p, iters);
+        kaliski_backward_hrsl(b, &v_in, &st, p, iters);
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+        for shot in 0..64usize {
+            let dx = U256::from(shot as u64 + 3);
+            for j in 0..n {
+                if dx.bit(j) { *sim.qubit_mut(v_in[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let phase = sim.global_phase();
+        eprintln!("varied roundtrip: phase=0x{:x}", phase);
+        let mut dirty = 0;
+        for q in (n as u32)..num_qubits {
+            if sim.qubit(QubitId(q)) != 0 { dirty += 1; }
+        }
+        eprintln!("  dirty={}", dirty);
+    }
+
+    /// Varied inputs per shot — closer to build()'s actual stress.
+    #[test]
+    fn test_hrsl_varied_shots() {
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 511;
+        let n = 256;
+
+        let b = &mut B::new();
+        let v_in = b.alloc_qubits(n);
+        let ty = b.alloc_qubits(n);
+        let lam = b.alloc_qubits(n);
+
+        with_kal_inv_hrsl(b, &v_in, p, iters, |b, inv_raw, scratch| {
+            let tmp_lo = b.alloc_qubits(2 * n - scratch.len());
+            let mut tmp_ext = tmp_lo.clone();
+            tmp_ext.extend_from_slice(scratch);
+            mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &lam, &ty, inv_raw, p, &tmp_ext);
+            for _ in 0..iters { mod_halve_inplace_fast(b, &lam, p); }
+            mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &v_in, p, &tmp_ext);
+            b.free_vec(&tmp_lo);
+        });
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        // Different (dx, dy) per shot.
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+        let mut dx_per_shot: Vec<U256> = Vec::new();
+        for shot in 0..64usize {
+            // dx = shot + 3, dy = shot * 2 + 5 (mod p)
+            let dx = U256::from(shot as u64 + 3);
+            let dy = U256::from((shot as u64) * 2 + 5);
+            dx_per_shot.push(dx);
+            for j in 0..n {
+                if dx.bit(j) { *sim.qubit_mut(v_in[j]) |= 1u64 << shot; }
+                if dy.bit(j) { *sim.qubit_mut(ty[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let phase = sim.global_phase();
+        eprintln!("varied shots: phase=0x{:x}", phase);
+        // Check ty = 0 for each shot.
+        let mut ty_vals: Vec<u64> = Vec::new();
+        for shot in 0..64 {
+            let mut ty_shot = 0u64;
+            for j in 0..64 {
+                ty_shot |= ((sim.qubit(ty[j]) >> shot) & 1) << j;
+            }
+            ty_vals.push(ty_shot);
+        }
+        let nonzero_ty = ty_vals.iter().filter(|&&v| v != 0).count();
+        eprintln!("varied shots: {} shots have ty!=0 (want 0)", nonzero_ty);
+    }
+
     /// Run HRSL+body using the EXACT (dx, dy) from build()'s failing shot 9023.
     #[test]
     fn test_hrsl_failing_shot() {
