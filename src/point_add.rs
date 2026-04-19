@@ -3215,6 +3215,248 @@ fn free_kaliski_state(b: &mut B, st: KaliskiState) {
 ///   - `st.r[..n]` holds the RAW Kaliski inverse `v^{-1} * 2^{2n} mod p`
 ///   - everything else in `st` is populated with deterministic iteration history
 ///
+/// HRSL-style Kaliski iteration: port of MS _MontBitGCDRound.
+/// Per-iter ~9n CCX (vs our ~11n) via direct controlled sub/add.
+/// IMPORTANT: a_q is allocated/freed WITHIN the iter (not persistent).
+/// m_hist[i] holds the per-iter decision bit. Uncompute via cx from r[0].
+fn kaliski_iteration_hrsl(
+    b: &mut B,
+    p: U256,
+    u: &[QubitId],
+    v: &[QubitId],
+    r: &[QubitId],
+    s: &[QubitId],
+    m_hist: QubitId,
+    _iter_idx: usize,
+) {
+    let n = u.len();
+    let a_q = b.alloc_qubit();
+    let b_q = b.alloc_qubit();
+
+    // STEP 1: a_q = (u is even) = NOT u[0]
+    b.x(u[0]);
+    b.cx(u[0], a_q);
+    b.x(u[0]);
+
+    // STEP 2: m_hist ^= (v even AND u odd)
+    b.x(v[0]);
+    b.x(a_q);
+    b.ccx(v[0], a_q, m_hist);
+    b.x(a_q);
+    b.x(v[0]);
+
+    // STEP 3: compare u > v, result in carry
+    let carry = b.alloc_qubit();
+    cmp_lt_into_fast(b, v, u, carry);
+
+    // STEP 4: tree of CNOTs + decision updates
+    b.cx(a_q, b_q);
+    b.cx(m_hist, b_q);
+    b.x(b_q);
+    b.ccx(carry, b_q, a_q);
+    b.ccx(carry, b_q, m_hist);
+    b.x(b_q);
+    b.cx(m_hist, b_q);
+    b.cx(a_q, b_q);
+
+    // STEP 5: uncompute carry
+    cmp_lt_into_fast(b, v, u, carry);
+    b.free(carry);
+
+    // STEP 6: cswap(a_q, u, v)
+    for i in 0..n { cswap(b, a_q, u[i], v[i]); }
+    // STEP 7: cswap(a_q, r, s)
+    for i in 0..n { cswap(b, a_q, r[i], s[i]); }
+
+    // STEP 8: flip a_q for sub/add control
+    b.cx(m_hist, a_q);
+    b.x(a_q);
+
+    // STEP 9: v -= u controlled by a_q (via tmp register)
+    {
+        let tmp = b.alloc_qubits(n);
+        for i in 0..n { b.ccx(a_q, u[i], tmp[i]); }
+        sub_nbit_qq_fast(b, &tmp, v);
+        for i in 0..n {
+            let m = b.alloc_bit();
+            b.hmr(tmp[i], m);
+            b.cz_if(a_q, u[i], m);
+        }
+        b.free_vec(&tmp);
+    }
+
+    // STEP 10: s += r controlled by a_q
+    {
+        let tmp = b.alloc_qubits(n);
+        for i in 0..n { b.ccx(a_q, r[i], tmp[i]); }
+        add_nbit_qq_fast(b, &tmp, s);
+        for i in 0..n {
+            let m = b.alloc_bit();
+            b.hmr(tmp[i], m);
+            b.cz_if(a_q, r[i], m);
+        }
+        b.free_vec(&tmp);
+    }
+
+    // STEP 11: unflip a_q
+    b.x(a_q);
+    b.cx(m_hist, a_q);
+
+    // STEP 12: halve v (shift right, v[0]=0 invariant after sub)
+    for i in 0..(n - 1) { b.swap(v[i], v[i + 1]); }
+
+    // STEP 13: double r mod p
+    mod_double_inplace_fast(b, r, p);
+
+    // STEP 14: cswap back (u, v)
+    for i in 0..n { cswap(b, a_q, u[i], v[i]); }
+    // STEP 15: cswap back (r, s)
+    for i in 0..n { cswap(b, a_q, r[i], s[i]); }
+
+    // STEP 16: uncompute a_q via r[0] parity
+    b.cx(r[0], a_q);
+
+    b.free(b_q);
+    b.free(a_q);
+}
+
+/// HRSL-style forward: runs kaliski_iteration_hrsl `iters` times.
+fn kaliski_forward_hrsl(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iters: usize) {
+    let n = v_in.len();
+    for i in 0..n { if bit(p, i) { b.x(st.u[i]); } }
+    for i in 0..n { b.cx(v_in[i], st.v_w[i]); }
+    b.x(st.s[0]);
+
+    for i in 0..iters {
+        kaliski_iteration_hrsl(
+            b, p, &st.u, &st.v_w, &st.r, &st.s,
+            st.m_hist[i], i,
+        );
+    }
+}
+
+/// HRSL-style backward: reverses kaliski_forward_hrsl exactly.
+fn kaliski_iteration_hrsl_backward(
+    b: &mut B, p: U256, u: &[QubitId], v: &[QubitId], r: &[QubitId], s: &[QubitId],
+    m_hist: QubitId, _iter_idx: usize,
+) {
+    let n = u.len();
+    let a_q = b.alloc_qubit();
+    let b_q = b.alloc_qubit();
+
+    // Reverse STEP 16: a_q = r[0] (pre-uncompute state)
+    b.cx(r[0], a_q);
+
+    // Reverse STEP 15, 14: cswap back
+    for i in 0..n { cswap(b, a_q, r[i], s[i]); }
+    for i in 0..n { cswap(b, a_q, u[i], v[i]); }
+
+    // Reverse STEP 13: halve r (inverse of double)
+    mod_halve_inplace_fast(b, r, p);
+
+    // Reverse STEP 12: un-halve v (shift left)
+    for i in (0..(n - 1)).rev() { b.swap(v[i], v[i + 1]); }
+
+    // Reverse STEP 11: flip a_q
+    b.cx(m_hist, a_q);
+    b.x(a_q);
+
+    // Reverse STEP 10: s -= r controlled
+    {
+        let tmp = b.alloc_qubits(n);
+        for i in 0..n { b.ccx(a_q, r[i], tmp[i]); }
+        sub_nbit_qq_fast(b, &tmp, s);
+        for i in 0..n {
+            let m = b.alloc_bit();
+            b.hmr(tmp[i], m);
+            b.cz_if(a_q, r[i], m);
+        }
+        b.free_vec(&tmp);
+    }
+
+    // Reverse STEP 9: v += u controlled
+    {
+        let tmp = b.alloc_qubits(n);
+        for i in 0..n { b.ccx(a_q, u[i], tmp[i]); }
+        add_nbit_qq_fast(b, &tmp, v);
+        for i in 0..n {
+            let m = b.alloc_bit();
+            b.hmr(tmp[i], m);
+            b.cz_if(a_q, u[i], m);
+        }
+        b.free_vec(&tmp);
+    }
+
+    // Reverse STEP 8: unflip a_q
+    b.x(a_q);
+    b.cx(m_hist, a_q);
+
+    // Reverse STEP 7, 6: cswap
+    for i in 0..n { cswap(b, a_q, r[i], s[i]); }
+    for i in 0..n { cswap(b, a_q, u[i], v[i]); }
+
+    // Reverse STEP 5: compute carry
+    let carry = b.alloc_qubit();
+    cmp_lt_into_fast(b, v, u, carry);
+
+    // Reverse STEP 4: tree of CNOTs (self-inverse)
+    b.cx(a_q, b_q);
+    b.cx(m_hist, b_q);
+    b.x(b_q);
+    b.ccx(carry, b_q, m_hist);
+    b.ccx(carry, b_q, a_q);
+    b.x(b_q);
+    b.cx(m_hist, b_q);
+    b.cx(a_q, b_q);
+
+    // Reverse STEP 3: uncompute carry
+    cmp_lt_into_fast(b, v, u, carry);
+    b.free(carry);
+
+    // Reverse STEP 2: un-XOR m_hist
+    b.x(v[0]);
+    b.x(a_q);
+    b.ccx(v[0], a_q, m_hist);
+    b.x(a_q);
+    b.x(v[0]);
+
+    // Reverse STEP 1: uncompute a_q
+    b.x(u[0]);
+    b.cx(u[0], a_q);
+    b.x(u[0]);
+
+    b.free(b_q);
+    b.free(a_q);
+}
+
+fn kaliski_backward_hrsl(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iters: usize) {
+    let n = v_in.len();
+    for i in (0..iters).rev() {
+        kaliski_iteration_hrsl_backward(
+            b, p, &st.u, &st.v_w, &st.r, &st.s,
+            st.m_hist[i], i,
+        );
+    }
+    // Reverse init
+    b.x(st.s[0]);
+    for i in 0..n { b.cx(v_in[i], st.v_w[i]); }
+    for i in 0..n { if bit(p, i) { b.x(st.u[i]); } }
+}
+
+fn with_kal_inv_hrsl<F: FnOnce(&mut B, &[QubitId], &[QubitId])>(
+    b: &mut B, v_in: &[QubitId], p: U256, iters: usize, body: F,
+) {
+    let n = v_in.len();
+    let st = alloc_kaliski_state(b, n, iters);
+    kaliski_forward_hrsl(b, v_in, &st, p, iters);
+    let scratch: Vec<QubitId> = st.u.iter().skip(1).copied()
+        .chain(st.v_w.iter().copied()).collect();
+    let r_low: Vec<QubitId> = st.r[..n].to_vec();
+    body(b, &r_low, &scratch);
+    kaliski_backward_hrsl(b, v_in, &st, p, iters);
+    free_kaliski_state(b, st);
+}
+
 /// The caller is responsible for applying the classical correction factor
 /// `K = 2^{-2n} mod p` and for calling `emit_inverse(kaliski_forward)` to
 /// restore `st.*` to all zero.
@@ -3778,8 +4020,8 @@ pub fn build() -> Vec<Op> {
     // quantum value (dx for pair 1, Rx-Ox for pair 2); their convergence
     // distributions may differ slightly. Boundaries verified empirically
     // against 9024 Fiat-Shamir shots.
-    const K1: usize = 2 * N - 112;  // pair 1 (invert dx) - new floor post op-stream shift
-    const K2: usize = 2 * N - 111;  // pair 2 (invert Rx-Ox)
+    const K1: usize = 2 * N - 1;    // HRSL experiment: safety max
+    const K2: usize = 2 * N - 111;  // pair 2 unchanged
     // Per-pair STEP0_SKIP: maximum iter count below convergence for each pair.
     const STEP0_SKIP_1: usize = 241;
     const STEP0_SKIP_2: usize = 301;
@@ -3790,16 +4032,13 @@ pub fn build() -> Vec<Op> {
 
     let lam = b.alloc_qubits(N);
 
-    // Pair 1: Kaliski's raw inverse carries a 2^K1 factor. Fold that
-    // scale onto lam itself, then halve lam down once. This avoids the
-    // inverse-register restore pass entirely.
-    with_kal_inv_raw_scratch(b, &tx, p, K1, STEP0_SKIP_1, |b, inv_raw, scratch| {
+    // Pair 1: HRSL experiment — use kaliski_forward_hrsl/backward_hrsl.
+    let _ = STEP0_SKIP_1;  // unused in HRSL variant
+    with_kal_inv_hrsl(b, &tx, p, K1, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
         tmp_ext.extend_from_slice(scratch);
-        // First mul: lam starts at 0, use zero-acc fast path (saves n-1 CCX).
         mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &lam, &ty, inv_raw, p, &tmp_ext);
-        // Halve K1 times: lam = -λ.
         for _ in 0..K1 { mod_halve_inplace_fast(b, &lam, p); }
         mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_ext);
         b.free_vec(&tmp_lo);
