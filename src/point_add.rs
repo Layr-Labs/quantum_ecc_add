@@ -2576,28 +2576,40 @@ fn kaliski_iteration(
     }
 
     // ─── STEP 1 ───
-    //   a ^= (f=1 AND u[0]=0)
-    //   m[i] ^= (f=1 AND a=0 AND v_w[0]=0)  [= f AND u[0] AND NOT v_w[0]]
-    //   b ^= a; b ^= m[i]
-    //
-    // Shared-intermediate trick: compute z = f AND u[0] once into b_f
-    // (known 0 here), then derive a_f = f XOR z = f AND NOT u[0] via CX,
-    // and update m_i via ccx(z, NOT v_w[0], m_i). Uncompute z, then set
-    // b_f to a_f XOR m_i as before. Saves 1 CCX per iter vs mcx2+mcx3.
-    b.ccx(f, u[0], b_f);                  // b_f = f AND u[0] (z)
-    b.cx(f, a_f);
-    b.cx(b_f, a_f);                       // a_f = f XOR z = f AND NOT u[0]
-    b.x(v_w[0]);
-    b.ccx(b_f, v_w[0], m_i);              // m_i ^= z AND NOT v_w[0]
-    b.x(v_w[0]);
-    // Measurement-uncompute z (= f AND u[0]) from b_f: 0 CCX.
-    {
-        let zm = b.alloc_bit();
-        b.hmr(b_f, zm);
-        b.cz_if(f, u[0], zm);
+    // Under iter < step0_skip, f=1 is constant classically. Replace f-controlled
+    // gates with their f=1 reductions: ccx(f,X,Y) → cx(X,Y), cx(f,X) → x(X),
+    // cz_if(f,X,m) → z_if(X,m). Saves 1 CCX per iter for the ccx(f,u[0],b_f).
+    let f_eq_one: bool = iter_idx < step0_skip;
+    if f_eq_one {
+        b.cx(u[0], b_f);                  // b_f = f·u[0] = u[0] under f=1
+        b.x(a_f);                         // a_f ^= f = 1
+        b.cx(b_f, a_f);                   // a_f = 1 XOR u[0] = NOT u[0]
+        b.x(v_w[0]);
+        b.ccx(b_f, v_w[0], m_i);          // m_i ^= u[0] · NOT v_w[0]
+        b.x(v_w[0]);
+        {
+            let zm = b.alloc_bit();
+            b.hmr(b_f, zm);
+            b.z_if(u[0], zm);             // phase correct for cx(u[0], b_f) under f=1
+        }
+        b.cx(a_f, b_f);
+        b.cx(m_i, b_f);
+    } else {
+        b.ccx(f, u[0], b_f);                  // b_f = f AND u[0] (z)
+        b.cx(f, a_f);
+        b.cx(b_f, a_f);                       // a_f = f XOR z = f AND NOT u[0]
+        b.x(v_w[0]);
+        b.ccx(b_f, v_w[0], m_i);              // m_i ^= z AND NOT v_w[0]
+        b.x(v_w[0]);
+        // Measurement-uncompute z (= f AND u[0]) from b_f: 0 CCX.
+        {
+            let zm = b.alloc_bit();
+            b.hmr(b_f, zm);
+            b.cz_if(f, u[0], zm);
+        }
+        b.cx(a_f, b_f);
+        b.cx(m_i, b_f);                       // b_f = a_f XOR m_i
     }
-    b.cx(a_f, b_f);
-    b.cx(m_i, b_f);                       // b_f = a_f XOR m_i
 
     // ─── STEP 2: with l = u > v_w: a ^= (f AND l AND ¬b); m_i ^= same.
     // Late-iter: u and v_w have bitlen ≤ 2n-iter, so only compare low 2n-iter bits.
@@ -2606,9 +2618,11 @@ fn kaliski_iteration(
     let l_gt = b.alloc_qubit();
     if iter_idx == 0 {
         b.x(l_gt);  // l_gt = 1 (since p > v_in always)
-        // Body (same as with_gt body):
+        // Body (same as with_gt body). Iter 0 has f=1, l_gt=1 both constant
+        // so ccx(f,l_gt,add_f) simplifies to x(add_f), and phase correction
+        // z_if(l_gt=1, am) = neg_if(am) (applied unconditionally on zm=1).
         b.x(b_f);
-        b.ccx(f, l_gt, add_f);
+        b.x(add_f);                       // add_f = 1 (= f·l_gt under both=1)
         let t = b.alloc_qubit();
         b.ccx(add_f, b_f, t);
         b.cx(t, a_f);
@@ -2622,11 +2636,33 @@ fn kaliski_iteration(
         {
             let am = b.alloc_bit();
             b.hmr(add_f, am);
-            b.cz_if(f, l_gt, am);
+            b.neg_if(am);                 // phase correct for x(add_f): z·z = 1, so any qubit phase on |1⟩ is just neg_if
         }
         b.x(b_f);
         b.x(l_gt);  // l_gt = 0
         b.free(l_gt);
+    } else if f_eq_one {
+    with_gt(b, &u[0..cmp_width], &v_w[0..cmp_width], l_gt, |b| {
+        b.x(b_f);
+        b.cx(l_gt, add_f);                // add_f = l_gt under f=1
+        let t = b.alloc_qubit();
+        b.ccx(add_f, b_f, t);
+        b.cx(t, a_f);
+        b.cx(t, m_i);
+        {
+            let tm = b.alloc_bit();
+            b.hmr(t, tm);
+            b.cz_if(add_f, b_f, tm);
+        }
+        b.free(t);
+        {
+            let am = b.alloc_bit();
+            b.hmr(add_f, am);
+            b.z_if(l_gt, am);             // phase correct for cx(l_gt, add_f) under f=1
+        }
+        b.x(b_f);
+    });
+    b.free(l_gt);
     } else {
     with_gt(b, &u[0..cmp_width], &v_w[0..cmp_width], l_gt, |b| {
         b.x(b_f);                          // negate polarity of b_f
@@ -2675,7 +2711,14 @@ fn kaliski_iteration(
     // add_f AND r in place (without unloading + reloading) by temporarily
     // XOR'ing r into u and re-applying ccx(add_f, u, tmp), then add tmp to
     // s and unload. Saves n CCX/iter.
-    mcx2_polar(b, f, true, b_f, false, add_f);
+    if f_eq_one {
+        // add_f = NOT b_f (under f=1). No CCX needed.
+        b.x(b_f);
+        b.cx(b_f, add_f);
+        b.x(b_f);
+    } else {
+        mcx2_polar(b, f, true, b_f, false, add_f);
+    }
     {
         let tmp = b.alloc_qubits(n);
         // Load tmp = add_f AND u. Late-iter bound: u[i]=0 for i >= 2n-iter.
@@ -2740,7 +2783,11 @@ fn kaliski_iteration(
     {
         let sm = b.alloc_bit();
         b.hmr(add_f, sm);
-        b.cz_if(f, b_f, sm);
+        if f_eq_one {
+            b.z_if(b_f, sm);  // phase correct for cx(b_f, add_f) under f=1
+        } else {
+            b.cz_if(f, b_f, sm);
+        }
     }
     b.x(b_f);
     b.cx(m_i, b_f);
@@ -3055,9 +3102,16 @@ fn kaliski_iteration_backward(
     for i in (0..(n - 1)).rev() { b.swap(v_w[i], v_w[i + 1]); }
 
     // ── Reverse STEP 5 ─────────────────────────────────────────────────
+    let f_eq_one: bool = iter_idx < step0_skip;
     b.cx(a_f, b_f);
     b.cx(m_i, b_f);
-    mcx2_polar(b, f, true, b_f, false, add_f);
+    if f_eq_one {
+        b.x(b_f);
+        b.cx(b_f, add_f);
+        b.x(b_f);
+    } else {
+        mcx2_polar(b, f, true, b_f, false, add_f);
+    }
 
     // ── Reverse STEP 4 (with measurement uncompute for unload) ─────────
     {
@@ -3105,7 +3159,11 @@ fn kaliski_iteration_backward(
     {
         let sm = b.alloc_bit();
         b.hmr(add_f, sm);
-        b.cz_if(f, b_f, sm);
+        if f_eq_one {
+            b.z_if(b_f, sm);
+        } else {
+            b.cz_if(f, b_f, sm);
+        }
     }
     b.x(b_f);
 
@@ -3124,7 +3182,7 @@ fn kaliski_iteration_backward(
     if iter_idx == 0 {
         b.x(l_gt);
         b.x(b_f);
-        b.ccx(f, l_gt, add_f);
+        b.x(add_f);
         let t = b.alloc_qubit();
         b.ccx(add_f, b_f, t);
         b.cx(t, m_i);
@@ -3138,11 +3196,33 @@ fn kaliski_iteration_backward(
         {
             let am = b.alloc_bit();
             b.hmr(add_f, am);
-            b.cz_if(f, l_gt, am);
+            b.neg_if(am);
         }
         b.x(b_f);
         b.x(l_gt);
         b.free(l_gt);
+    } else if f_eq_one {
+    with_gt(b, &u[0..cmp_width], &v_w[0..cmp_width], l_gt, |b| {
+        b.x(b_f);
+        b.cx(l_gt, add_f);
+        let t = b.alloc_qubit();
+        b.ccx(add_f, b_f, t);
+        b.cx(t, m_i);
+        b.cx(t, a_f);
+        {
+            let tm = b.alloc_bit();
+            b.hmr(t, tm);
+            b.cz_if(add_f, b_f, tm);
+        }
+        b.free(t);
+        {
+            let am = b.alloc_bit();
+            b.hmr(add_f, am);
+            b.z_if(l_gt, am);
+        }
+        b.x(b_f);
+    });
+    b.free(l_gt);
     } else {
     with_gt(b, &u[0..cmp_width], &v_w[0..cmp_width], l_gt, |b| {
         b.x(b_f);
@@ -3171,19 +3251,35 @@ fn kaliski_iteration_backward(
     }
 
     // ── Reverse STEP 1 ─────────────────────────────────────────────────
-    b.cx(m_i, b_f);
-    b.cx(a_f, b_f);
-    b.ccx(f, u[0], b_f);
-    b.x(v_w[0]);
-    b.ccx(b_f, v_w[0], m_i);
-    b.x(v_w[0]);
-    b.cx(b_f, a_f);
-    b.cx(f, a_f);
-    // Measurement-uncompute z = f AND u[0] from b_f: 0 CCX.
-    {
-        let zm = b.alloc_bit();
-        b.hmr(b_f, zm);
-        b.cz_if(f, u[0], zm);
+    if f_eq_one {
+        b.cx(m_i, b_f);
+        b.cx(a_f, b_f);
+        b.cx(u[0], b_f);
+        b.x(v_w[0]);
+        b.ccx(b_f, v_w[0], m_i);
+        b.x(v_w[0]);
+        b.cx(b_f, a_f);
+        b.x(a_f);
+        {
+            let zm = b.alloc_bit();
+            b.hmr(b_f, zm);
+            b.z_if(u[0], zm);
+        }
+    } else {
+        b.cx(m_i, b_f);
+        b.cx(a_f, b_f);
+        b.ccx(f, u[0], b_f);
+        b.x(v_w[0]);
+        b.ccx(b_f, v_w[0], m_i);
+        b.x(v_w[0]);
+        b.cx(b_f, a_f);
+        b.cx(f, a_f);
+        // Measurement-uncompute z = f AND u[0] from b_f: 0 CCX.
+        {
+            let zm = b.alloc_bit();
+            b.hmr(b_f, zm);
+            b.cz_if(f, u[0], zm);
+        }
     }
 
     // ── Reverse STEP 0 (with measurement uncompute of OR chain) ────────
