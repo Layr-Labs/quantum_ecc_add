@@ -4256,6 +4256,109 @@ mod tests {
         eprintln!("phase = 0x{:x}", phase);
     }
 
+    /// Test with_kal_inv_hrsl with body = CX-copy r to a fresh register.
+    #[test]
+    fn test_hrsl_wrapper_copy_r() {
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 511;
+        let n = 256;
+
+        let b = &mut B::new();
+        let v_in = b.alloc_qubits(n);
+        let out = b.alloc_qubits(n);
+        with_kal_inv_hrsl(b, &v_in, p, iters, |b, inv_raw, _scratch| {
+            for i in 0..n { b.cx(inv_raw[i], out[i]); }
+        });
+        // Need to also uncompute out — copy inv_raw to cancel
+        // Actually we WANT out to hold the inverse, so don't uncompute.
+        // But then out is dirty at end. To verify roundtrip, check v_in preserved + scratch clean.
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        let v_val = U256::from(7u64);
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+        for j in 0..n {
+            if v_val.bit(j) {
+                for shot in 0..64 {
+                    *sim.qubit_mut(v_in[j]) |= 1u64 << shot;
+                }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let mut v_final = U256::ZERO;
+        let mut out_final = U256::ZERO;
+        for j in 0..n {
+            if (sim.qubit(v_in[j]) >> 0) & 1 == 1 { v_final |= U256::from(1) << j; }
+            if (sim.qubit(out[j]) >> 0) & 1 == 1 { out_final |= U256::from(1) << j; }
+        }
+        let vinv = classical_modinv(v_val, p);
+        let two_k = pow_mod_2_k(p, iters);
+        let expected_pos = mulmod(vinv, two_k, p);
+        let expected_neg = if expected_pos.is_zero() { U256::ZERO } else { p.wrapping_sub(expected_pos) };
+        eprintln!("copy_r: v_final=0x{:x} out=0x{:x} exp-=0x{:x}", v_final, out_final, expected_neg);
+        assert_eq!(v_final, v_val);
+
+        let mut dirty = 0;
+        for q in (2*n as u32)..num_qubits {
+            let val = sim.qubit(QubitId(q));
+            if val != 0 { dirty += 1; }
+        }
+        let phase = sim.global_phase();
+        eprintln!("  dirty (non-v,out)={} phase=0x{:x}", dirty, phase);
+    }
+
+    /// Test with_kal_inv_hrsl wrapper with empty body — should leave everything clean.
+    #[test]
+    fn test_hrsl_wrapper_empty_body() {
+        let p = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+        let iters = 511;
+        let n = 256;
+
+        let b = &mut B::new();
+        let v_in = b.alloc_qubits(n);
+        with_kal_inv_hrsl(b, &v_in, p, iters, |_, _, _| { /* empty body */ });
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        let v_val = U256::from(7u64);
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+        for j in 0..n {
+            if v_val.bit(j) {
+                for shot in 0..64 {
+                    *sim.qubit_mut(v_in[j]) |= 1u64 << shot;
+                }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let mut v_final = U256::ZERO;
+        for j in 0..n {
+            if (sim.qubit(v_in[j]) >> 0) & 1 == 1 { v_final |= U256::from(1) << j; }
+        }
+        assert_eq!(v_final, v_val, "v_in corrupted by wrapper");
+
+        let mut dirty = 0;
+        for q in (n as u32)..num_qubits {
+            let val = sim.qubit(QubitId(q));
+            if val != 0 { dirty += 1; }
+        }
+        let phase = sim.global_phase();
+        eprintln!("wrapper empty body: v_in={} dirty={} phase=0x{:x}", v_final == v_val, dirty, phase);
+        assert_eq!(dirty, 0, "wrapper leaked {} qubits", dirty);
+        assert_eq!(phase, 0, "wrapper phase garbage");
+    }
+
     /// Count CCX ops in the flat vs Bennett qrom implementations.
     #[test]
     fn test_qrom_ccx_count_compare() {
