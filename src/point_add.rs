@@ -2677,7 +2677,14 @@ fn kaliski_iteration(
         let tmp = b.alloc_qubits(n);
         // Load tmp = add_f AND u. Late-iter bound: u[i]=0 for i >= 2n-iter.
         let load_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-        for i in 0..load_width { b.ccx(add_f, u[i], tmp[i]); }
+        for i in 0..load_width {
+            if iter_idx == 0 && i == 0 {
+                // u[0] is classically 1 after STEP 3 (cswap with a=v_w[0]).
+                b.cx(add_f, tmp[i]);
+            } else {
+                b.ccx(add_f, u[i], tmp[i]);
+            }
+        }
         // Sub v_w -= tmp. Late-iter: both high bits 0, truncate to load_width.
         let tmp_sub_slice: Vec<QubitId> = tmp[0..load_width].to_vec();
         let v_w_sub_slice: Vec<QubitId> = v_w[0..load_width].to_vec();
