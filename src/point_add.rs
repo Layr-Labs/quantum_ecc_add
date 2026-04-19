@@ -3565,8 +3565,9 @@ fn kaliski_iteration_hrsl(
     let a_q = b.alloc_qubit();
     let b_q = b.alloc_qubit();
 
-    // STEP 0: update f via termination check.
-    {
+    // STEP 0: update f via termination check. Conservative skip at iter<100.
+    const HRSL_STEP0_SKIP: usize = 0;
+    if iter_idx >= HRSL_STEP0_SKIP {
         let or_width = if iter_idx < n { n } else { 2 * n - iter_idx };
         let zero_flag = b.alloc_qubit();
         with_eq_zero_fast(b, &v[0..or_width], zero_flag, |b| {
@@ -3812,8 +3813,9 @@ fn kaliski_iteration_hrsl_backward(
     b.ccx(f_flag, u[0], a_q);
     b.x(u[0]);
 
-    // Reverse STEP 0: undo termination flag update.
-    {
+    // Reverse STEP 0: undo termination flag update. Match forward's conservative skip.
+    const HRSL_STEP0_SKIP: usize = 0;
+    if iter_idx >= HRSL_STEP0_SKIP {
         let or_width = if iter_idx < n { n } else { 2 * n - iter_idx };
         let zero_flag = b.alloc_qubit();
         b.cx(m_hist, f_flag);
