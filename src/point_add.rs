@@ -2560,19 +2560,14 @@ fn kaliski_iteration(
     b_f: QubitId,
     add_f: QubitId,
     iter_idx: usize,
+    step0_skip: usize,
 ) {
     let n = u.len();
 
     // ─── STEP 0: is_zero = (v_w == 0);  m[i] ^= (f AND is_zero);  f ^= m[i] ───
-    // Truncated OR chain for late iter: v_w's bits [2n-iter..n-1] are 0
-    // (Kaliski invariant), so OR only of low 2n-iter bits suffices.
-    //
-    // Skip STEP 0 for early iters where v_w is guaranteed nonzero (Kaliski
-    // cannot converge until iter ≥ some threshold). When v_w ≠ 0, STEP 0
-    // is a no-op (is_zero=0 ⇒ m_i unchanged, f unchanged). STEP0_SKIP must
-    // be ≤ min-convergence-iter across all shots (probed empirically).
-    const STEP0_SKIP: usize = 241;
-    if iter_idx >= STEP0_SKIP {
+    // Skip STEP 0 for iters < step0_skip (provably v_w ≠ 0 there, so STEP 0
+    // is a no-op: is_zero=0 ⇒ m_i, f unchanged). Probed empirically per-pair.
+    if iter_idx >= step0_skip {
         let or_width = if iter_idx < n { n } else { 2 * n - iter_idx };
         with_eq_zero_fast(b, &v_w[0..or_width], add_f, |b| {
             b.ccx(f, add_f, m_i);
@@ -2904,7 +2899,7 @@ fn free_kaliski_state(b: &mut B, st: KaliskiState) {
 /// The caller is responsible for applying the classical correction factor
 /// `K = 2^{-2n} mod p` and for calling `emit_inverse(kaliski_forward)` to
 /// restore `st.*` to all zero.
-fn kaliski_forward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iters: usize) {
+fn kaliski_forward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iters: usize, step0_skip: usize) {
     let n = v_in.len();
 
     // ─── Init ───
@@ -2918,10 +2913,6 @@ fn kaliski_forward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iter
     b.x(st.f_flag);
 
     // ─── iter count iterations ───
-    // Paired wrapper: structural scaffold for future stride-2 optimizations
-    // (shared OR-chain / comparator / fused cswap). Currently 0-delta vs
-    // simple for-loop — future iterations replace the paired body with
-    // shared-computation primitives.
     let mut i = 0usize;
     while i + 1 < iters {
         kaliski_iteration(
@@ -2929,12 +2920,14 @@ fn kaliski_forward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iter
             st.m_hist[i],
             st.f_flag, st.a_flag, st.b_flag, st.add_flag,
             i,
+            step0_skip,
         );
         kaliski_iteration(
             b, p, &st.u, &st.v_w, &st.r, &st.s,
             st.m_hist[i + 1],
             st.f_flag, st.a_flag, st.b_flag, st.add_flag,
             i + 1,
+            step0_skip,
         );
         i += 2;
     }
@@ -2944,6 +2937,7 @@ fn kaliski_forward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iter
             st.m_hist[i],
             st.f_flag, st.a_flag, st.b_flag, st.add_flag,
             i,
+            step0_skip,
         );
         i += 1;
     }
@@ -3032,6 +3026,7 @@ fn kaliski_iteration_backward(
     b_f: QubitId,
     add_f: QubitId,
     iter_idx: usize,
+    step0_skip: usize,
 ) {
     let n = u.len();
 
@@ -3192,11 +3187,9 @@ fn kaliski_iteration_backward(
     }
 
     // ── Reverse STEP 0 (with measurement uncompute of OR chain) ────────
-    // Truncated for late iter: only low 2n-iter bits of v_w are possibly nonzero.
-    // Must match forward STEP0_SKIP — backward only runs reverse-STEP-0 at
+    // Must match forward step0_skip — backward only runs reverse-STEP-0 at
     // iters where forward actually ran STEP 0, otherwise m_hist garbage.
-    const STEP0_SKIP_BW: usize = 241;
-    if iter_idx >= STEP0_SKIP_BW {
+    if iter_idx >= step0_skip {
         b.cx(m_i, f);
         let or_width = if iter_idx < n { n } else { 2 * n - iter_idx };
         let nv = or_width;
@@ -3233,7 +3226,7 @@ fn kaliski_iteration_backward(
 
 /// Explicit backward pass for kaliski_forward. Uses measurement-based
 /// uncomputation to save ~511 CCX per iteration vs emit_inverse.
-fn kaliski_backward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iters: usize) {
+fn kaliski_backward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iters: usize, step0_skip: usize) {
     let n = v_in.len();
 
     // ─── Reverse iter count iterations (in reverse order) ───
@@ -3243,6 +3236,7 @@ fn kaliski_backward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, ite
             st.m_hist[i],
             st.f_flag, st.a_flag, st.b_flag, st.add_flag,
             i,
+            step0_skip,
         );
     }
 
@@ -3266,19 +3260,17 @@ fn with_kal_inv_raw<F: FnOnce(&mut B, &[QubitId])>(
     v_in: &[QubitId],
     p: U256,
     iters: usize,
+    step0_skip: usize,
     body: F,
 ) {
     let n = v_in.len();
     let st = alloc_kaliski_state(b, n, iters);
 
-    // Forward kaliski. st.r[..n] holds raw = v_in^{-1} * 2^iters mod p.
-    kaliski_forward(b, v_in, &st, p, iters);
+    kaliski_forward(b, v_in, &st, p, iters, step0_skip);
 
     let r_low: Vec<QubitId> = st.r[..n].to_vec();
     body(b, &r_low);
-    // Explicit backward pass (uses measurement-based uncompute, saves
-    // ~511 CCX per iteration vs the emit_inverse version).
-    kaliski_backward(b, v_in, &st, p, iters);
+    kaliski_backward(b, v_in, &st, p, iters, step0_skip);
 
     free_kaliski_state(b, st);
 }
@@ -3288,12 +3280,13 @@ fn with_kal_inv_raw_scratch<F: FnOnce(&mut B, &[QubitId], &[QubitId])>(
     v_in: &[QubitId],
     p: U256,
     iters: usize,
+    step0_skip: usize,
     body: F,
 ) {
     let n = v_in.len();
     let st = alloc_kaliski_state(b, n, iters);
 
-    kaliski_forward(b, v_in, &st, p, iters);
+    kaliski_forward(b, v_in, &st, p, iters, step0_skip);
 
     // After Kaliski forward with K ≥ empirical convergence floor, u = 1 and
     // v_w = 0 on all shots. So u[1..n] and v_w[0..n] are all zero — usable as
@@ -3309,7 +3302,7 @@ fn with_kal_inv_raw_scratch<F: FnOnce(&mut B, &[QubitId], &[QubitId])>(
     let r_low: Vec<QubitId> = st.r[..n].to_vec();
     body(b, &r_low, &scratch);
 
-    kaliski_backward(b, v_in, &st, p, iters);
+    kaliski_backward(b, v_in, &st, p, iters, step0_skip);
 
     free_kaliski_state(b, st);
 }
@@ -3319,9 +3312,10 @@ fn with_kal_inv<F: FnOnce(&mut B, &[QubitId])>(
     v_in: &[QubitId],
     p: U256,
     iters: usize,
+    step0_skip: usize,
     body: F,
 ) {
-    with_kal_inv_raw(b, v_in, p, iters, |b, inv_raw| {
+    with_kal_inv_raw(b, v_in, p, iters, step0_skip, |b, inv_raw| {
         // Kaliski's raw output carries a 2^iters factor. Apply the
         // correction in place when callers need the exact inverse.
         for _ in 0..iters { mod_halve_inplace_fast(b, inv_raw, p); }
@@ -3330,7 +3324,7 @@ fn with_kal_inv<F: FnOnce(&mut B, &[QubitId])>(
     });
 }
 
-fn kaliski_inv_inplace(b: &mut B, v_in: &[QubitId], p: U256, iters: usize) {
+fn kaliski_inv_inplace(b: &mut B, v_in: &[QubitId], p: U256, iters: usize, step0_skip: usize) {
     let n = v_in.len();
 
     // Bennett compute-copy-uncompute pattern. Each call of
@@ -3340,7 +3334,7 @@ fn kaliski_inv_inplace(b: &mut B, v_in: &[QubitId], p: U256, iters: usize) {
     let output = b.alloc_qubits(n);
 
     // ─── Phase 1: compute inverse of v_in into output ───
-    kaliski_forward(b, v_in, &st, p, iters);
+    kaliski_forward(b, v_in, &st, p, iters, step0_skip);
     // st.r[..n] now holds raw inverse (in mod 2p, low n bits).
     // Apply classical correction: st.r[..n] *= K mod p, where K = 2^{-2n} mod p.
     let two_2n = pow_mod_2_k(p, 2 * n);
@@ -3351,7 +3345,7 @@ fn kaliski_inv_inplace(b: &mut B, v_in: &[QubitId], p: U256, iters: usize) {
     // Undo the correction: st.r[..n] *= K^{-1} mod p.
     in_place_mul_const(b, &st.r[..n], two_2n, p);
     // Now st is back to its post-kaliski_forward state. Reverse the forward.
-    emit_inverse(b, |b| kaliski_forward(b, v_in, &st, p, iters));
+    emit_inverse(b, |b| kaliski_forward(b, v_in, &st, p, iters, step0_skip));
     // st is all 0 again. v_in unchanged. output = v_in^{-1}.
 
     // Swap v_in and output.
@@ -3362,11 +3356,11 @@ fn kaliski_inv_inplace(b: &mut B, v_in: &[QubitId], p: U256, iters: usize) {
     // Compute inverse of current v_in (which is v_orig^{-1}), = v_orig,
     // and XOR it into output. Since output currently = v_orig, the XOR
     // zeroes output.
-    kaliski_forward(b, v_in, &st, p, iters);
+    kaliski_forward(b, v_in, &st, p, iters, step0_skip);
     in_place_mul_const(b, &st.r[..n], k_const, p);
     for i in 0..n { b.cx(st.r[i], output[i]); }   // output ^= v_orig = 0
     in_place_mul_const(b, &st.r[..n], two_2n, p);
-    emit_inverse(b, |b| kaliski_forward(b, v_in, &st, p, iters));
+    emit_inverse(b, |b| kaliski_forward(b, v_in, &st, p, iters, step0_skip));
     // st all 0, output all 0 (hopefully), v_in = inverse.
 
     b.free_vec(&output);
@@ -3418,6 +3412,9 @@ pub fn build() -> Vec<Op> {
     // against 9024 Fiat-Shamir shots.
     const K1: usize = 2 * N - 111;  // pair 1 (invert dx) - expanded-scratch floor
     const K2: usize = 2 * N - 111;  // pair 2 (invert Rx-Ox) - expanded-scratch floor
+    // Per-pair STEP0_SKIP: maximum iter count below convergence for each pair.
+    const STEP0_SKIP_1: usize = 241;
+    const STEP0_SKIP_2: usize = 301;
 
     // Step 1-2: Px -= Qx, Py -= Qy
     mod_sub_qb(b, &tx, &ox, p);
@@ -3428,7 +3425,7 @@ pub fn build() -> Vec<Op> {
     // Pair 1: Kaliski's raw inverse carries a 2^K1 factor. Fold that
     // scale onto lam itself, then halve lam down once. This avoids the
     // inverse-register restore pass entirely.
-    with_kal_inv_raw_scratch(b, &tx, p, K1, |b, inv_raw, scratch| {
+    with_kal_inv_raw_scratch(b, &tx, p, K1, STEP0_SKIP_1, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
         tmp_ext.extend_from_slice(scratch);
@@ -3449,7 +3446,7 @@ pub fn build() -> Vec<Op> {
     // cheaper than mod_sub_qb by n CCX. Result equivalent: tx = Rx - Qx.
     mod_add_qb(b, &tx, &ox, p);                          // tx = dx - λ² + 3Qx
     mod_neg_inplace_fast(b, &tx, p);                     // tx = -(...)= Rx - Qx
-    with_kal_inv_raw_scratch(b, &tx, p, K2, |b, inv_raw, scratch| {
+    with_kal_inv_raw_scratch(b, &tx, p, K2, STEP0_SKIP_2, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
         tmp_ext.extend_from_slice(scratch);
