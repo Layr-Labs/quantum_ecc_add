@@ -2318,6 +2318,43 @@ fn karatsuba_square_inverse(
 }
 
 /// Schoolbook squarer with Bennett uncompute.
+/// Symmetric of squaring_sub: acc += x² mod p.
+#[allow(dead_code)]
+fn squaring_add_to_acc_schoolbook(
+    b: &mut B,
+    acc: &[QubitId],
+    x: &[QubitId],
+    p: U256,
+) {
+    let n = acc.len();
+    debug_assert_eq!(n, 256);
+    debug_assert_eq!(x.len(), n);
+    let tmp_ext = b.alloc_qubits(2 * n);
+
+    schoolbook_square_symmetric(b, x, &tmp_ext);
+
+    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
+    let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
+    mod_add_qq_fast(b, acc, &lo, p);
+    // 977 consolidation for +hi·c: +hi·{2^0, 2^4, -2^6, 2^10, 2^32}.
+    mod_add_qq_fast(b, acc, &hi, p);
+    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
+    mod_add_qq_fast(b, acc, &hi, p);
+    for _ in 0..2 { mod_double_inplace_fast(b, &hi, p); }
+    mod_sub_qq_fast(b, acc, &hi, p);
+    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
+    mod_add_qq_fast(b, acc, &hi, p);
+    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
+    mod_add_qq_fast(b, acc, &hi, p);
+    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
+    for _ in 0..10 {
+        mod_halve_inplace_fast(b, &hi, p);
+    }
+
+    schoolbook_square_symmetric_inverse(b, x, &tmp_ext);
+    b.free_vec(&tmp_ext);
+}
+
 fn squaring_sub_from_acc_schoolbook(
     b: &mut B,
     acc: &[QubitId],
@@ -2968,6 +3005,41 @@ fn submod(a: U256, b: U256, p: U256) -> U256 {
     let a = a % p;
     let b = b % p;
     if a >= b { a.wrapping_sub(b) } else { p.wrapping_sub(b.wrapping_sub(a)) }
+}
+
+/// Quantum: compute `n_out = dy² - (Px + 2·Qx) · dx² mod p` into n_out (starts 0).
+/// dx, dy are quantum (256 bits). Px, Qx are classical. n_out is a 256-qubit register.
+#[allow(dead_code)]
+fn compute_montgomery_n(
+    b: &mut B,
+    dx: &[QubitId],
+    dy: &[QubitId],
+    px: U256,
+    qx: U256,
+    n_out: &[QubitId],
+    p: U256,
+) {
+    // Step 1: n_out += dy² mod p.
+    squaring_add_to_acc_schoolbook(b, n_out, dy, p);
+
+    // Step 2: compute dx² into a tmp register, then subtract (Px+2Qx)·dx² from n_out.
+    // We use mul_by_const_acc_windowed which does acc -= const · quantum.
+    // Need dx² first. Use tmp_dx2 = dx² mod p.
+    let dx2 = b.alloc_qubits(256);
+    squaring_add_to_acc_schoolbook(b, &dx2, dx, p);
+
+    // n_out -= (Px + 2Qx) · dx² mod p.
+    let coeff = addmod(px, addmod(qx, qx, p), p);
+    mul_by_const_acc_windowed(b, &dx2, coeff, n_out, p, true /*subtract*/);
+
+    // Uncompute dx².
+    // We run squaring_add again in reverse — no, schoolbook_square is a compute-only
+    // primitive. Use emit_inverse or run the inverse explicitly.
+    // squaring_add_to_acc doesn't have a clean reverse — need to reconstruct.
+    // Easier: run squaring_add AGAIN with dx2 as acc: this DOUBLES dx², not cancels.
+    // Use squaring_sub: dx2 -= dx² should give 0.
+    squaring_sub_from_acc_schoolbook(b, &dx2, dx, p);
+    b.free_vec(&dx2);
 }
 
 /// Classical: compute N = dy² - (Px + 2·Qx) · dx² mod p.
@@ -4406,6 +4478,126 @@ mod tests {
         let mut h = Shake256::default();
         Update::update(&mut h, b"test-qrom");
         h.finalize_xof()
+    }
+
+    /// Test compute_montgomery_n quantum primitive matches classical.
+    #[test]
+    fn test_compute_montgomery_n() {
+        use sha3::digest::XofReader;
+        let p = SECP256K1_P;
+        let n = 256;
+
+        let curve = crate::weierstrass_elliptic_curve::WeierstrassEllipticCurve {
+            modulus: p,
+            a: U256::from(0),
+            b: U256::from(7),
+            gx: U256::from_str_radix("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16).unwrap(),
+            gy: U256::from_str_radix("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16).unwrap(),
+            order: U256::from_str_radix("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16).unwrap(),
+        };
+        let mut xof = make_xof();
+        let mut rb = [0u8; 32];
+        xof.read(&mut rb); let k1 = U256::from_le_bytes(rb);
+        xof.read(&mut rb); let k2 = U256::from_le_bytes(rb);
+        let (px_val, _) = curve.mul(curve.gx, curve.gy, k1);
+        let (qx_val, _qy_val) = curve.mul(curve.gx, curve.gy, k2);
+        // Px, Qx classical (as far as the circuit knows at BUILD time).
+
+        let b = &mut B::new();
+        let dx = b.alloc_qubits(n);
+        let dy = b.alloc_qubits(n);
+        let n_out = b.alloc_qubits(n);
+        compute_montgomery_n(b, &dx, &dy, px_val, qx_val, &n_out, p);
+        let ops = b.ops.clone();
+        let nq = b.next_qubit;
+        let nb = b.next_bit;
+
+        let mut xof2 = make_xof();
+        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof2);
+        sim.clear_for_shot();
+
+        let mut dxs: Vec<U256> = Vec::with_capacity(64);
+        let mut dys: Vec<U256> = Vec::with_capacity(64);
+        let mut vxof = make_xof();
+        for shot in 0..64 {
+            let mut rb2 = [0u8; 32];
+            vxof.read(&mut rb2);
+            let dxv = U256::from_le_bytes(rb2) % p;
+            vxof.read(&mut rb2);
+            let dyv = U256::from_le_bytes(rb2) % p;
+            dxs.push(dxv); dys.push(dyv);
+            for j in 0..n {
+                if dxv.bit(j) { *sim.qubit_mut(dx[j]) |= 1u64 << shot; }
+                if dyv.bit(j) { *sim.qubit_mut(dy[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let mut pass = 0;
+        for shot in 0..64 {
+            let exp = classical_montgomery_n(dxs[shot], dys[shot], px_val, qx_val, p);
+            let mut got = U256::ZERO;
+            for j in 0..n {
+                if (sim.qubit(n_out[j]) >> shot) & 1 == 1 { got |= U256::from(1) << j; }
+            }
+            if got == exp { pass += 1; }
+            else if shot < 2 { eprintln!("shot {}: got=0x{:x} exp=0x{:x}", shot, got, exp); }
+        }
+        eprintln!("compute_montgomery_n: {}/64 pass, phase=0x{:x}", pass, sim.global_phase());
+        assert_eq!(pass, 64);
+        assert_eq!(sim.global_phase(), 0);
+    }
+
+    /// Test squaring_add_to_acc_schoolbook computes acc += x² mod p.
+    #[test]
+    fn test_squaring_add_to_acc() {
+        use sha3::digest::XofReader;
+        let p = SECP256K1_P;
+        let n = 256;
+        let b = &mut B::new();
+        let x = b.alloc_qubits(n);
+        let acc = b.alloc_qubits(n);
+        squaring_add_to_acc_schoolbook(b, &acc, &x, p);
+        let ops = b.ops.clone();
+        let nq = b.next_qubit;
+        let nb = b.next_bit;
+
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof);
+        sim.clear_for_shot();
+        let mut vxof = make_xof();
+        let mut xs: Vec<U256> = Vec::with_capacity(64);
+        let mut accs: Vec<U256> = Vec::with_capacity(64);
+        for shot in 0..64 {
+            let mut rb = [0u8; 32];
+            vxof.read(&mut rb);
+            let xv = U256::from_le_bytes(rb) % p;
+            vxof.read(&mut rb);
+            let av = U256::from_le_bytes(rb) % p;
+            xs.push(xv);
+            accs.push(av);
+            for j in 0..n {
+                if xv.bit(j) { *sim.qubit_mut(x[j]) |= 1u64 << shot; }
+                if av.bit(j) { *sim.qubit_mut(acc[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let mut pass = 0;
+        for shot in 0..64 {
+            let exp = addmod(accs[shot], mulmod(xs[shot], xs[shot], p), p);
+            let mut got = U256::ZERO;
+            for j in 0..n {
+                if (sim.qubit(acc[j]) >> shot) & 1 == 1 { got |= U256::from(1) << j; }
+            }
+            if got == exp { pass += 1; }
+            else if shot < 2 {
+                eprintln!("shot {}: x=0x{:x} acc_orig=0x{:x} got=0x{:x} exp=0x{:x}", shot, xs[shot], accs[shot], got, exp);
+            }
+        }
+        eprintln!("squaring_add_to_acc: {}/64 pass, phase=0x{:x}", pass, sim.global_phase());
+        assert_eq!(pass, 64);
+        assert_eq!(sim.global_phase(), 0);
     }
 
     /// Verify Montgomery identity: (Rx - Qx) · dx² = N classically.
