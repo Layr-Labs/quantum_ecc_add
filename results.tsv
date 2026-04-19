@@ -487,3 +487,5 @@ timestamp	commit	toffoli	clifford	qubits	ops	correct	notes
 1776576062	bc2d2b1	4351164.000	22315498.998	2997	29798803	OK	add unused QROM lookup primitive (infrastructure)
 1776576195	0814886	4351164.000	22315498.998	2997	29798803	OK	QROM primitive cleaned up (unused but correct)
 1776576569	4b1a511	4351164.000	22315498.998	2997	29798803	OK	add windowed mul_by_const_acc primitive (unused)
+1776576639	a882e79	1876049.362	9740998.144	3226	30640013	FAIL	wire windowed mul replacing pair 1 halve loop | CLASSICAL MISMATCH shot 3799: got (0xfce730d89b2f6de486cb26ea772574d4650abcf7c0387eab329ac2711cf30a15,0xce367547dabba2b145ab32fde5d30c71abda901c18e0471692a8f6d3ce82a33) exp (0xe36400a9037ca41cfc8c0a60c7ceeafbdc903fd7131deb7d7b9282a82d07111b,0x60994f7ad0f26b9a33d7b7358ed8bb030354942deac8ea448f0a0d5b86e1e32)
+1776576696	a882e79	4351164.000	22315498.998	2997	29798803	OK	revert windowed wire-in
