@@ -553,6 +553,82 @@ fn qrom_lookup(b: &mut B, table: &[U256], addr: &[QubitId], out: &[QubitId]) {
     }
 }
 
+/// Bennett-tree recursive QROM: 2^w - 1 CCX forward, 0 CCX backward via HMR.
+/// Matches MS's EqualLookup primitive (Microsoft.Quantum.Crypto.Basics).
+/// Saves (2^w (w-1)) - (2^w - 1) = 2^w(w-2)+1 CCX vs the flat version.
+/// For w=4: 33 CCX saved per lookup.
+#[allow(dead_code)]
+fn qrom_lookup_bennett(b: &mut B, table: &[U256], addr: &[QubitId], out: &[QubitId]) {
+    qrom_lookup_bennett_ctrl(b, table, addr, out, None);
+}
+
+#[allow(dead_code)]
+fn qrom_lookup_bennett_ctrl(
+    b: &mut B,
+    table: &[U256],
+    addr: &[QubitId],
+    out: &[QubitId],
+    ctrl: Option<QubitId>,
+) {
+    let w = addr.len();
+    let m = out.len();
+    assert_eq!(table.len(), 1usize << w);
+
+    if w == 0 {
+        match ctrl {
+            None => {
+                for j in 0..m {
+                    if bit(table[0], j) {
+                        b.x(out[j]);
+                    }
+                }
+            }
+            Some(c) => {
+                for j in 0..m {
+                    if bit(table[0], j) {
+                        b.cx(c, out[j]);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    let high_bit = addr[w - 1];
+    let rest = &addr[0..w - 1];
+    let half = 1usize << (w - 1);
+    let low_half = &table[0..half];
+    let high_half = &table[half..table.len()];
+
+    // q = ctrl AND NOT high_bit.
+    let q = b.alloc_qubit();
+    b.x(high_bit);
+    match ctrl {
+        None => b.cx(high_bit, q),
+        Some(c) => b.ccx(c, high_bit, q),
+    }
+    b.x(high_bit);
+
+    qrom_lookup_bennett_ctrl(b, low_half, rest, out, Some(q));
+
+    // Flip q from (ctrl AND NOT high_bit) to (ctrl AND high_bit).
+    match ctrl {
+        None => b.x(q),
+        Some(c) => b.cx(c, q),
+    }
+
+    qrom_lookup_bennett_ctrl(b, high_half, rest, out, Some(q));
+
+    // Uncompute q via HMR. Pre-HMR q = ctrl AND high_bit.
+    let mb = b.alloc_bit();
+    b.hmr(q, mb);
+    match ctrl {
+        None => b.z_if(high_bit, mb),
+        Some(c) => b.cz_if(c, high_bit, mb),
+    }
+    b.free(q);
+}
+
 /// `acc := (acc + a) mod p`. Both `acc` and `a` are n-bit quantum registers
 /// with value in [0, p). Solinas reduction using c = 2^n - p: sum ∈ [0, 2p),
 /// then add c, branch on top bit to either clear it (reduction) or undo
@@ -3755,4 +3831,116 @@ pub fn build() -> Vec<Op> {
     b.free_vec(&lam);
 
     b.ops.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::Simulator;
+    use sha3::{digest::{ExtendableOutput, Update}, Shake256};
+
+    fn make_xof() -> sha3::Shake256Reader {
+        use sha3::digest::ExtendableOutput;
+        let mut h = Shake256::default();
+        Update::update(&mut h, b"test-qrom");
+        h.finalize_xof()
+    }
+
+    /// Count CCX ops in the flat vs Bennett qrom implementations.
+    #[test]
+    fn test_qrom_ccx_count_compare() {
+        let w = 4;
+        let m = 256;
+        let table: Vec<U256> = (0..(1u64 << w))
+            .map(|i| U256::from(i * 99_887_766_u64))
+            .collect();
+
+        // Flat
+        let b1 = &mut B::new();
+        let addr1 = b1.alloc_qubits(w);
+        let out1 = b1.alloc_qubits(m);
+        qrom_lookup(b1, &table, &addr1, &out1);
+        let flat_ccx = b1.ops.iter()
+            .filter(|o| matches!(o.kind, crate::circuit::OperationType::CCX))
+            .count();
+
+        // Bennett
+        let b2 = &mut B::new();
+        let addr2 = b2.alloc_qubits(w);
+        let out2 = b2.alloc_qubits(m);
+        qrom_lookup_bennett(b2, &table, &addr2, &out2);
+        let bennett_ccx = b2.ops.iter()
+            .filter(|o| matches!(o.kind, crate::circuit::OperationType::CCX))
+            .count();
+
+        eprintln!("w={} flat CCX = {}, bennett CCX = {}, saving = {}",
+            w, flat_ccx, bennett_ccx, flat_ccx as i64 - bennett_ccx as i64);
+        assert!(bennett_ccx < flat_ccx, "Bennett should have fewer CCX ops");
+    }
+
+    /// Verifies qrom_lookup_bennett writes the correct table value and leaves
+    /// ancillas (q scratch qubits) clean at the end. Tests all 2^w addr values
+    /// across 64 shots (one shot per addr pattern, rest zero).
+    #[test]
+    fn test_qrom_lookup_bennett_w4() {
+        let w = 4;
+        let m = 8;
+        // Classical table: table[i] = i * 37 + 13 mod 2^m.
+        let table: Vec<U256> = (0..(1u64 << w))
+            .map(|i| U256::from((i.wrapping_mul(37).wrapping_add(13)) & ((1u64 << m) - 1)))
+            .collect();
+
+        // Build the op stream for ONE qrom call.
+        let b = &mut B::new();
+        let addr = b.alloc_qubits(w);
+        let out = b.alloc_qubits(m);
+        for _ in 0..w { b.declare_qubit_register(&addr[0..0]); } // dummy
+        qrom_lookup_bennett(b, &table, &addr, &out);
+        let ops = b.ops.clone();
+        let num_qubits = b.next_qubit;
+        let num_bits = b.next_bit;
+
+        // Simulate: for each shot s in 0..64, set addr = s mod 2^w.
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        sim.clear_for_shot();
+        for shot in 0..64 {
+            let a = (shot as u64) & ((1u64 << w) - 1);
+            for k in 0..w {
+                if (a >> k) & 1 == 1 {
+                    *sim.qubit_mut(addr[k]) |= 1u64 << shot;
+                }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        // Check: for each shot, out should hold table[shot mod 2^w].
+        let mut mismatches = 0;
+        for shot in 0..64 {
+            let a = (shot as u64) & ((1u64 << w) - 1);
+            let expected: u64 = (a.wrapping_mul(37).wrapping_add(13)) & ((1u64 << m) - 1);
+            let mut got: u64 = 0;
+            for j in 0..m {
+                let bit_val = (sim.qubit(out[j]) >> shot) & 1;
+                got |= bit_val << j;
+            }
+            if got != expected {
+                mismatches += 1;
+                if mismatches < 5 {
+                    eprintln!("shot {} addr={} got={} exp={}", shot, a, got, expected);
+                }
+            }
+        }
+        assert_eq!(mismatches, 0, "qrom_lookup_bennett has {} mismatches", mismatches);
+
+        // Also check that all internally-allocated ancillas are zeroed
+        // (q scratch qubits used by the Bennett tree). These are qubits
+        // beyond addr + out = w + m. Any leaked qubit will have nonzero bits.
+        for q in (w + m)..(num_qubits as usize) {
+            let qid = QubitId(q as u32);
+            let val = sim.qubit(qid);
+            assert_eq!(val & 0xFFFFFFFFFFFFFFFFu64, 0,
+                "scratch qubit {} not clean: 0x{:x}", q, val);
+        }
+    }
 }
