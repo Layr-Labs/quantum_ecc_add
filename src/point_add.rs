@@ -2601,8 +2601,33 @@ fn kaliski_iteration(
 
     // ─── STEP 2: with l = u > v_w: a ^= (f AND l AND ¬b); m_i ^= same.
     // Late-iter: u and v_w have bitlen ≤ 2n-iter, so only compare low 2n-iter bits.
+    // Iter 0: u=p (classical), v_w=v_in (<p precondition), so l_gt=1 always. Skip compare.
     let cmp_width = if iter_idx < n { n } else { 2 * n - iter_idx - 1 };
     let l_gt = b.alloc_qubit();
+    if iter_idx == 0 {
+        b.x(l_gt);  // l_gt = 1 (since p > v_in always)
+        // Body (same as with_gt body):
+        b.x(b_f);
+        b.ccx(f, l_gt, add_f);
+        let t = b.alloc_qubit();
+        b.ccx(add_f, b_f, t);
+        b.cx(t, a_f);
+        b.cx(t, m_i);
+        {
+            let tm = b.alloc_bit();
+            b.hmr(t, tm);
+            b.cz_if(add_f, b_f, tm);
+        }
+        b.free(t);
+        {
+            let am = b.alloc_bit();
+            b.hmr(add_f, am);
+            b.cz_if(f, l_gt, am);
+        }
+        b.x(b_f);
+        b.x(l_gt);  // l_gt = 0
+        b.free(l_gt);
+    } else {
     with_gt(b, &u[0..cmp_width], &v_w[0..cmp_width], l_gt, |b| {
         b.x(b_f);                          // negate polarity of b_f
         b.ccx(f, l_gt, add_f);             // add_f = f AND l_gt
@@ -2627,6 +2652,7 @@ fn kaliski_iteration(
         b.x(b_f);
     });
     b.free(l_gt);
+    }
 
     // ─── STEP 3: with control(a): swap(u, v_w); swap(r, s) ───
     // Late-iter truncation: Kaliski invariant: bitlen(u) + bitlen(v_w) ≤ 2n-iter,
