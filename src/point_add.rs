@@ -3263,21 +3263,7 @@ fn kaliski_iteration_hrsl(
     let carry = b.alloc_qubit();
     cmp_lt_into_fast(b, v, u, carry);
 
-    // STEP 4: tree of CNOTs + decision updates (gated on f)
-    b.cx(a_q, b_q);
-    b.cx(m_hist, b_q);
-    b.x(b_q);
-    {
-        let fc = b.alloc_qubit();
-        b.ccx(f_flag, carry, fc);  // fc = f AND carry
-        b.ccx(fc, b_q, a_q);
-        b.ccx(fc, b_q, m_hist);
-        b.ccx(f_flag, carry, fc);  // uncompute fc
-        b.free(fc);
-    }
-    b.x(b_q);
-    b.cx(m_hist, b_q);
-    b.cx(a_q, b_q);
+    // STEP 4 DIAGNOSTIC SKIP
 
     // STEP 5: uncompute carry
     cmp_lt_into_fast(b, v, u, carry);
@@ -3420,21 +3406,7 @@ fn kaliski_iteration_hrsl_backward(
     let carry = b.alloc_qubit();
     cmp_lt_into_fast(b, v, u, carry);
 
-    // Reverse STEP 4: tree of CNOTs (gated on f)
-    b.cx(a_q, b_q);
-    b.cx(m_hist, b_q);
-    b.x(b_q);
-    {
-        let fc = b.alloc_qubit();
-        b.ccx(f_flag, carry, fc);
-        b.ccx(fc, b_q, m_hist);
-        b.ccx(fc, b_q, a_q);
-        b.ccx(f_flag, carry, fc);
-        b.free(fc);
-    }
-    b.x(b_q);
-    b.cx(m_hist, b_q);
-    b.cx(a_q, b_q);
+    // Reverse STEP 4 DIAGNOSTIC SKIP
 
     // Reverse STEP 3: uncompute carry
     cmp_lt_into_fast(b, v, u, carry);
