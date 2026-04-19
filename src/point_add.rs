@@ -4480,6 +4480,81 @@ mod tests {
         h.finalize_xof()
     }
 
+    /// Test computing c = dx · N where N = dy² - (Px+2Qx)·dx² mod p.
+    /// c is the value to be inverted in the Montgomery batched approach.
+    #[test]
+    fn test_compute_c_dx_times_n() {
+        use sha3::digest::XofReader;
+        let p = SECP256K1_P;
+        let n = 256;
+
+        let curve = crate::weierstrass_elliptic_curve::WeierstrassEllipticCurve {
+            modulus: p,
+            a: U256::from(0),
+            b: U256::from(7),
+            gx: U256::from_str_radix("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16).unwrap(),
+            gy: U256::from_str_radix("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16).unwrap(),
+            order: U256::from_str_radix("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16).unwrap(),
+        };
+        let mut xof = make_xof();
+        let mut rb = [0u8; 32];
+        xof.read(&mut rb); let k1 = U256::from_le_bytes(rb);
+        xof.read(&mut rb); let k2 = U256::from_le_bytes(rb);
+        let (px_val, _) = curve.mul(curve.gx, curve.gy, k1);
+        let (qx_val, _) = curve.mul(curve.gx, curve.gy, k2);
+
+        let b = &mut B::new();
+        let dx = b.alloc_qubits(n);
+        let dy = b.alloc_qubits(n);
+        let n_reg = b.alloc_qubits(n);
+        let c_reg = b.alloc_qubits(n);
+        let tmp_ext = b.alloc_qubits(2 * n);
+
+        // Step 1: compute N into n_reg.
+        compute_montgomery_n(b, &dx, &dy, px_val, qx_val, &n_reg, p);
+        // Step 2: c_reg = dx · N (quantum × quantum mul).
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &c_reg, &dx, &n_reg, p, &tmp_ext);
+        let ops = b.ops.clone();
+        let nq = b.next_qubit;
+        let nb = b.next_bit;
+
+        let mut xof2 = make_xof();
+        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof2);
+        sim.clear_for_shot();
+        let mut vxof = make_xof();
+        let mut dxs: Vec<U256> = Vec::with_capacity(64);
+        let mut dys: Vec<U256> = Vec::with_capacity(64);
+        for shot in 0..64 {
+            let mut rb2 = [0u8; 32];
+            vxof.read(&mut rb2);
+            let dxv = U256::from_le_bytes(rb2) % p;
+            vxof.read(&mut rb2);
+            let dyv = U256::from_le_bytes(rb2) % p;
+            dxs.push(dxv); dys.push(dyv);
+            for j in 0..n {
+                if dxv.bit(j) { *sim.qubit_mut(dx[j]) |= 1u64 << shot; }
+                if dyv.bit(j) { *sim.qubit_mut(dy[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+
+        let mut pass = 0;
+        for shot in 0..64 {
+            let nval = classical_montgomery_n(dxs[shot], dys[shot], px_val, qx_val, p);
+            let exp_c = mulmod(dxs[shot], nval, p);
+            let mut got_c = U256::ZERO;
+            for j in 0..n {
+                if (sim.qubit(c_reg[j]) >> shot) & 1 == 1 { got_c |= U256::from(1) << j; }
+            }
+            if got_c == exp_c { pass += 1; }
+            else if shot < 2 { eprintln!("shot {}: got c=0x{:x} exp=0x{:x}", shot, got_c, exp_c); }
+        }
+        let _ = tmp_ext;
+        eprintln!("c = dx · N: {}/64 pass, phase=0x{:x}", pass, sim.global_phase());
+        assert_eq!(pass, 64);
+        assert_eq!(sim.global_phase(), 0);
+    }
+
     /// Test compute_montgomery_n quantum primitive matches classical.
     #[test]
     fn test_compute_montgomery_n() {
