@@ -1060,6 +1060,104 @@ fn cadd_nbit_const_sparse_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
     b.free(c0);
 }
 
+/// Sparse-aware controlled subtract of classical constant c mod 2^n, via borrow chain.
+/// acc -= ctrl ? c : 0. Saves vs csub_nbit_const_fast by exploiting c's sparsity
+/// (only ~7 set bits for c = 2^32 + 977).
+fn csub_nbit_const_sparse_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
+    let n = acc.len();
+    let mut first = 0usize;
+    while first < n && !bit(c, first) { first += 1; }
+    if first >= n { return; }
+
+    // Initial borrow at position `first`: b0 = NOT acc[first]_old AND ctrl. acc[first] ^= ctrl.
+    let mut carries: Vec<QubitId> = Vec::with_capacity(n - first);
+    let b0 = b.alloc_qubit();
+    b.x(acc[first]);
+    b.ccx(ctrl, acc[first], b0);
+    b.x(acc[first]);
+    b.cx(ctrl, acc[first]);
+    carries.push(b0);
+
+    for i in (first + 1)..n {
+        let prev = carries[carries.len() - 1];
+        let is_last = i == n - 1;
+        if is_last {
+            if bit(c, i) {
+                // Sum only = a XOR prev XOR ctrl.
+                b.cx(prev, acc[i]);
+                b.cx(ctrl, acc[i]);
+            } else {
+                b.cx(prev, acc[i]);
+            }
+            continue;
+        }
+        let new_borrow = b.alloc_qubit();
+        if bit(c, i) {
+            // Full subtractor (set bit): diff = a XOR ctrl XOR prev;
+            // borrow_out = maj(NOT a, ctrl, prev) = (NOT a XOR ctrl)(prev XOR ctrl) XOR ctrl.
+            b.x(acc[i]);                          // acc = NOT a
+            b.cx(ctrl, acc[i]);                   // acc = NOT a XOR ctrl
+            b.cx(ctrl, prev);                     // prev = prev XOR ctrl
+            b.ccx(acc[i], prev, new_borrow);     // nb = (NOT a XOR ctrl)(prev XOR ctrl)
+            b.cx(ctrl, new_borrow);               // nb = maj(NOT a, ctrl, prev)
+            b.cx(prev, acc[i]);                  // acc = NOT a XOR prev
+            b.cx(ctrl, prev);                     // prev = prev (restored)
+            b.cx(ctrl, acc[i]);                   // acc = NOT a XOR prev XOR ctrl
+            b.x(acc[i]);                          // acc = a XOR prev XOR ctrl = diff
+        } else {
+            // Half subtractor (zero bit): diff = a XOR prev; borrow_out = NOT a AND prev.
+            b.x(acc[i]);
+            b.ccx(prev, acc[i], new_borrow);
+            b.x(acc[i]);
+            b.cx(prev, acc[i]);
+        }
+        carries.push(new_borrow);
+    }
+
+    // Backward uncompute via HMR.
+    for i in (first + 1..n - 1).rev() {
+        let new_borrow = carries.pop().unwrap();
+        let prev = carries[carries.len() - 1];
+        if bit(c, i) {
+            // Rebuild state at ccx moment: acc = NOT a XOR ctrl, prev = prev XOR ctrl,
+            // new_borrow = (NOT a XOR ctrl)(prev XOR ctrl).
+            b.cx(ctrl, new_borrow);               // nb XOR ctrl = (NOT a XOR ctrl)(prev XOR ctrl)
+            b.cx(prev, acc[i]);                  // acc = a XOR ctrl
+            b.x(acc[i]);                          // acc = NOT a XOR ctrl
+            b.cx(ctrl, prev);                     // prev = prev XOR ctrl
+            let m = b.alloc_bit();
+            b.hmr(new_borrow, m);
+            b.cz_if(acc[i], prev, m);
+            // Restore.
+            b.cx(ctrl, prev);                     // prev = prev
+            b.x(acc[i]);                          // acc = a XOR ctrl
+            b.cx(prev, acc[i]);                  // acc = a XOR ctrl XOR prev = diff
+        } else {
+            // Rebuild: acc = NOT a, new_borrow = prev AND NOT a.
+            b.cx(prev, acc[i]);                  // acc = a
+            b.x(acc[i]);                          // acc = NOT a
+            let m = b.alloc_bit();
+            b.hmr(new_borrow, m);
+            b.cz_if(prev, acc[i], m);
+            b.x(acc[i]);                          // acc = a
+            b.cx(prev, acc[i]);                  // acc = a XOR prev = diff
+        }
+        b.free(new_borrow);
+    }
+
+    // Uncompute b0. Forward had: x(acc); ccx(ctrl, acc, b0); x(acc); cx(ctrl, acc).
+    // Currently: acc[first] = a XOR ctrl (diff at first); b0 = NOT a_orig AND ctrl.
+    let b0 = carries.pop().unwrap();
+    b.cx(ctrl, acc[first]);                       // acc = a_orig
+    b.x(acc[first]);                              // acc = NOT a_orig
+    let m = b.alloc_bit();
+    b.hmr(b0, m);
+    b.cz_if(ctrl, acc[first], m);
+    b.x(acc[first]);                              // acc = a_orig
+    b.cx(ctrl, acc[first]);                       // acc = a_orig XOR ctrl = diff
+    b.free(b0);
+}
+
 fn add_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256) {
     let n = acc.len();
     let a = load_const(b, n, c);
@@ -4126,6 +4224,141 @@ mod tests {
         let mut h = Shake256::default();
         Update::update(&mut h, b"test-qrom");
         h.finalize_xof()
+    }
+
+    #[test]
+    fn test_csub_sparse_n256_highbit() {
+        // Test with acc having bit 100 and bit 200 set, ctrl=1, c=2^32+977.
+        let c_val = U256::from(1u64 << 32) | U256::from(977u64);
+        let n = 256usize;
+        let acc_u: U256 = (U256::from(1u64) << 100) | (U256::from(1u64) << 200) | U256::from(5u64);
+        let expected = acc_u.wrapping_sub(c_val);
+
+        let bb = &mut B::new();
+        let acc = bb.alloc_qubits(n);
+        let ctrl = bb.alloc_qubit();
+        csub_nbit_const_sparse_fast(bb, &acc, c_val, ctrl);
+        let ops = bb.ops.clone();
+        let nq = bb.next_qubit;
+        let nb = bb.next_bit;
+
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof);
+        sim.clear_for_shot();
+        for j in 0..n {
+            if acc_u.bit(j) { *sim.qubit_mut(acc[j]) |= 1u64; }
+        }
+        *sim.qubit_mut(ctrl) |= 1u64;
+        sim.apply_iter(ops.into_iter());
+
+        let mut got = U256::ZERO;
+        for j in 0..n {
+            if (sim.qubit(acc[j]) >> 0) & 1 == 1 {
+                got |= U256::from(1) << j;
+            }
+        }
+        assert_eq!(got, expected, "csub sparse high-bit test: got=0x{:x} exp=0x{:x}", got, expected);
+        // Check no dirty qubits
+        for q in (n as u32 + 1)..nq {
+            let v = sim.qubit(QubitId(q));
+            assert_eq!(v, 0, "dirty qubit {}: 0x{:x}", q, v);
+        }
+        assert_eq!(sim.global_phase(), 0, "phase nonzero");
+    }
+
+    #[test]
+    fn test_csub_sparse_n128_single() {
+        let c_val = U256::from(977u64);
+        let n = 128usize;
+        let acc_val: u64 = 1;
+        let ctrl_val: u64 = 0;
+        let bb = &mut B::new();
+        let acc = bb.alloc_qubits(n);
+        let ctrl = bb.alloc_qubit();
+        csub_nbit_const_sparse_fast(bb, &acc, c_val, ctrl);
+        let ops = bb.ops.clone();
+        let nq = bb.next_qubit;
+        let nb = bb.next_bit;
+        eprintln!("ops count: {}, qubits: {}, bits: {}", ops.len(), nq, nb);
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof);
+        sim.clear_for_shot();
+        for j in 0..n.min(64) {
+            if (acc_val >> j) & 1 == 1 { *sim.qubit_mut(acc[j]) |= 1u64; }
+        }
+        if ctrl_val == 1 { *sim.qubit_mut(ctrl) |= 1u64; }
+        // Apply ops one at a time, checking qubit 64 state each step
+        let mut prev_val = sim.qubit(acc[64]);
+        for (idx, op) in ops.into_iter().enumerate() {
+            sim.apply_iter(std::iter::once(op));
+            let new_val = sim.qubit(acc[64]);
+            if new_val != prev_val {
+                eprintln!("op #{} changed acc[64] from 0x{:x} to 0x{:x}", idx, prev_val, new_val);
+                prev_val = new_val;
+            }
+        }
+        eprintln!("final acc[64] = 0x{:x}", prev_val);
+    }
+
+    /// Unit test: csub_nbit_const_sparse_fast matches csub_nbit_const_fast.
+    #[test]
+    fn test_csub_nbit_const_sparse_fast() {
+        for &c_val in &[U256::from(977u64), U256::from(1u64 << 32) | U256::from(977u64), U256::from(1u64), U256::from(1u64) << 32] {
+            for n in [8usize, 16, 32, 40, 64, 128, 256] {
+                // Only test values where c fits in n bits.
+                if (c_val >> n) != U256::ZERO { continue; }
+                for acc_val in 0..(1u64 << n.min(8)) {
+                    for ctrl_val in [0u64, 1u64] {
+                        // Expected: acc - (ctrl ? c : 0) mod 2^n.
+                        let mut expected = U256::from(acc_val);
+                        if ctrl_val == 1 {
+                            expected = expected.wrapping_sub(c_val);
+                        }
+                        let mask = if n == 256 { U256::MAX } else { (U256::from(1) << n) - U256::from(1) };
+                        expected = expected & mask;
+
+                        let bb = &mut B::new();
+                        let acc = bb.alloc_qubits(n);
+                        let ctrl = bb.alloc_qubit();
+                        csub_nbit_const_sparse_fast(bb, &acc, c_val, ctrl);
+                        let ops = bb.ops.clone();
+                        let nq = bb.next_qubit;
+                        let nb = bb.next_bit;
+
+                        let mut xof = make_xof();
+                        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof);
+                        sim.clear_for_shot();
+                        for j in 0..n.min(64) {
+                            if (acc_val >> j) & 1 == 1 {
+                                *sim.qubit_mut(acc[j]) |= 1u64;
+                            }
+                        }
+                        if ctrl_val == 1 {
+                            *sim.qubit_mut(ctrl) |= 1u64;
+                        }
+                        sim.apply_iter(ops.into_iter());
+
+                        let mut got = U256::ZERO;
+                        for j in 0..n {
+                            if (sim.qubit(acc[j]) >> 0) & 1 == 1 {
+                                got |= U256::from(1) << j;
+                            }
+                        }
+                        let ctrl_final = (sim.qubit(ctrl) >> 0) & 1;
+                        assert_eq!(got, expected, "n={} c={:x} acc={:x} ctrl={} got={:x} exp={:x}",
+                            n, c_val, acc_val, ctrl_val, got, expected);
+                        assert_eq!(ctrl_final, ctrl_val, "ctrl modified");
+                        // Check no dirty qubits beyond acc and ctrl.
+                        for q in (n as u32 + 1)..nq {
+                            let v = sim.qubit(QubitId(q));
+                            assert_eq!(v, 0, "dirty qubit {} = 0x{:x} for n={} c={:x} acc={:x} ctrl={}", q, v, n, c_val, acc_val, ctrl_val);
+                        }
+                        // Check global phase is 0.
+                        assert_eq!(sim.global_phase(), 0, "phase nonzero for n={} c={:x} acc={:x} ctrl={}", n, c_val, acc_val, ctrl_val);
+                    }
+                }
+            }
+        }
     }
 
     /// Unit test: kaliski_forward_hrsl on v_in=3, check st.r matches expected.
