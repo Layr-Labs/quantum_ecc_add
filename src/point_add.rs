@@ -3083,6 +3083,32 @@ fn compute_montgomery_n(
     b.free_vec(&dx2);
 }
 
+/// Inverse of compute_montgomery_n: n_in holds N, this zeroes it.
+#[allow(dead_code)]
+fn uncompute_montgomery_n(
+    b: &mut B,
+    dx: &[QubitId],
+    dy: &[QubitId],
+    px: U256,
+    qx: U256,
+    n_in: &[QubitId],
+    p: U256,
+) {
+    // Reverse order: last-first. compute_montgomery_n did: +dy², +coeff·dx², -coeff·dx² (via subtract).
+    // Actually: compute did `squaring_add_to_acc(n_out, dy)` then `squaring_add_to_acc(dx2, dx)` then
+    // `mul_by_const_acc_windowed(dx2, coeff, n_out, subtract=true)` (n_out -= coeff·dx2) then
+    // `squaring_sub_from_acc(dx2, dx)` (uncompute dx2).
+    // Inverse: create dx2, squaring_add, then mul_by_const with subtract=false (n_out += coeff·dx2),
+    // then squaring_sub (dx2 → 0), then squaring_sub on n_out (n_out -= dy²).
+    let dx2 = b.alloc_qubits(256);
+    squaring_add_to_acc_schoolbook(b, &dx2, dx, p);
+    let coeff = addmod(px, addmod(qx, qx, p), p);
+    mul_by_const_acc_windowed(b, &dx2, coeff, n_in, p, false /* add */);
+    squaring_sub_from_acc_schoolbook(b, &dx2, dx, p);
+    b.free_vec(&dx2);
+    squaring_sub_from_acc_schoolbook(b, n_in, dy, p);
+}
+
 /// Classical: compute N = dy² - (Px + 2·Qx) · dx² mod p.
 #[allow(dead_code)]
 fn classical_montgomery_n(dx: U256, dy: U256, px: U256, qx: U256, p: U256) -> U256 {
@@ -4521,6 +4547,48 @@ mod tests {
         let mut h = Shake256::default();
         Update::update(&mut h, b"test-qrom");
         h.finalize_xof()
+    }
+
+    /// Test compute_montgomery_n + uncompute_montgomery_n roundtrip.
+    #[test]
+    fn test_montgomery_n_roundtrip() {
+        use sha3::digest::XofReader;
+        let p = SECP256K1_P;
+        let n = 256;
+        let px_val = U256::from_str_radix("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16).unwrap();
+        let qx_val = U256::from_str_radix("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16).unwrap();
+        let b = &mut B::new();
+        let dx = b.alloc_qubits(n);
+        let dy = b.alloc_qubits(n);
+        let n_reg = b.alloc_qubits(n);
+        compute_montgomery_n(b, &dx, &dy, px_val, qx_val, &n_reg, p);
+        uncompute_montgomery_n(b, &dx, &dy, px_val, qx_val, &n_reg, p);
+        let ops = b.ops.clone();
+        let nq = b.next_qubit;
+        let nb = b.next_bit;
+        let mut xof = make_xof();
+        let mut sim = Simulator::new(nq as usize, nb as usize, &mut xof);
+        sim.clear_for_shot();
+        let mut vxof = make_xof();
+        for shot in 0..64 {
+            let mut rb = [0u8; 32];
+            vxof.read(&mut rb);
+            let dxv = U256::from_le_bytes(rb) % p;
+            vxof.read(&mut rb);
+            let dyv = U256::from_le_bytes(rb) % p;
+            for j in 0..n {
+                if dxv.bit(j) { *sim.qubit_mut(dx[j]) |= 1u64 << shot; }
+                if dyv.bit(j) { *sim.qubit_mut(dy[j]) |= 1u64 << shot; }
+            }
+        }
+        sim.apply_iter(ops.into_iter());
+        let mut dirty_n = 0;
+        for j in 0..n {
+            if sim.qubit(n_reg[j]) != 0 { dirty_n += 1; }
+        }
+        eprintln!("N roundtrip: dirty_n={}/{}, phase=0x{:x}", dirty_n, n, sim.global_phase());
+        assert_eq!(dirty_n, 0);
+        assert_eq!(sim.global_phase(), 0);
     }
 
     /// Verify mod_mul_sub_from_acc is inverse of mod_mul_write_into_zero_acc: roundtrip → acc=0.
