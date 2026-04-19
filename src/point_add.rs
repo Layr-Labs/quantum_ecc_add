@@ -4308,9 +4308,8 @@ pub fn build() -> Vec<Op> {
 
     let lam = b.alloc_qubits(N);
 
-    // Pair 1: HRSL Kaliski (with cswap truncation optimizations) at K=400.
-    let _ = STEP0_SKIP_1;
-    with_kal_inv_hrsl(b, &tx, p, K1, |b, inv_raw, scratch| {
+    // Pair 1: baseline Kaliski.
+    with_kal_inv_raw_scratch(b, &tx, p, K1, STEP0_SKIP_1, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
         tmp_ext.extend_from_slice(scratch);
@@ -4329,8 +4328,7 @@ pub fn build() -> Vec<Op> {
     // cheaper than mod_sub_qb by n CCX. Result equivalent: tx = Rx - Qx.
     mod_add_qb(b, &tx, &ox, p);                          // tx = dx - λ² + 3Qx
     mod_neg_inplace_fast(b, &tx, p);                     // tx = -(...)= Rx - Qx
-    let _ = STEP0_SKIP_2;
-    with_kal_inv_hrsl(b, &tx, p, K2, |b, inv_raw, scratch| {
+    with_kal_inv_raw_scratch(b, &tx, p, K2, STEP0_SKIP_2, |b, inv_raw, scratch| {
         let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
         let mut tmp_ext = tmp_lo.clone();
         tmp_ext.extend_from_slice(scratch);

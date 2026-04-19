@@ -579,3 +579,4 @@ timestamp	commit	toffoli	clifford	qubits	ops	correct	notes
 1776640636	f1cf5b1	5098536.000	25765067.099	2997	37311273	OK	HRSL + with_gt + mod_double_no_corr (thresh=255)
 1776640712	f1cf5b1	36148.468	182746.677	2997	37314477	FAIL	HRSL + all opts + Gidney uncompute | PHASE GARBAGE: global_phase = 0xd8f2a8b3a1728e90 across 64 live shots (must be 0)
 1776640804	f1cf5b1	5096934.000	25767478.847	2997	37312875	OK	HRSL + HMR fc uncompute
+1776640906	83e68b3	4351164.000	22315498.998	2997	29798803	OK	baseline confirm after HRSL bundling explorations
