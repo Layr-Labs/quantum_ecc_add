@@ -2988,6 +2988,62 @@ fn mul_by_const_acc(
     b.free_vec(&tmp);
 }
 
+/// Windowed version of mul_by_const_acc using QROM lookups.
+/// For each w-bit window of x, lookup (window_val * c * 2^pos) mod p from a
+/// 2^w-entry classical table and add (or subtract) into acc.
+///
+/// Cost per window (w=4): ~96 CCX lookup + n CCX add + 96 CCX uncompute ≈ 448 CCX.
+/// Over n/w = 64 windows: ~28K CCX. Competitive with sparse mul_by_const_acc
+/// only for DENSE classical constants (like 2^{-K1} mod p).
+///
+/// NOT YET WIRED INTO build() — multi-turn scaffolding.
+#[allow(dead_code)]
+fn mul_by_const_acc_windowed(
+    b: &mut B,
+    x: &[QubitId],
+    c: U256,
+    acc: &[QubitId],
+    p: U256,
+    subtract: bool,
+) {
+    let n = x.len();
+    let w = 4usize; // window size (optimal-ish for n=256)
+    debug_assert_eq!(n % w, 0, "n must be multiple of w for windowed mul");
+
+    if c == U256::ZERO {
+        return;
+    }
+
+    let tmp = b.alloc_qubits(n);
+
+    let n_windows = n / w;
+    for wi in 0..n_windows {
+        let window_pos = wi * w;
+        // Precompute table: entry j = (j * c * 2^pos) mod p.
+        let two_pos = pow_mod_2_k(p, window_pos);
+        let c_pos = mulmod(c, two_pos, p);
+        let mut table: Vec<U256> = Vec::with_capacity(1 << w);
+        for j in 0..(1u64 << w) {
+            table.push(mulmod(U256::from(j), c_pos, p));
+        }
+        // Address bits: x[window_pos..window_pos+w].
+        let addr: Vec<QubitId> = x[window_pos..window_pos + w].to_vec();
+        // Lookup: tmp ^= table[addr].
+        qrom_lookup(b, &table, &addr, &tmp);
+        // Modular add/sub: acc ±= tmp.
+        if subtract {
+            mod_sub_qq_fast(b, acc, &tmp, p);
+        } else {
+            mod_add_qq_fast(b, acc, &tmp, p);
+        }
+        // Uncompute lookup (self-inverse since qrom_lookup's XORs are CX and
+        // ANDs are HMR-uncomputed; running it twice zeros tmp).
+        qrom_lookup(b, &table, &addr, &tmp);
+    }
+
+    b.free_vec(&tmp);
+}
+
 /// Persistent state for the Kaliski forward computation. Transients are
 /// allocated inside the iteration body; `emit_inverse` will correctly
 /// reverse them because it skips R ops (the free markers) in the reverse
