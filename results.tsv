@@ -539,3 +539,4 @@ timestamp	commit	toffoli	clifford	qubits	ops	correct	notes
 1776598259	59dec5d	42194.348	218401.933	3107	43211883	FAIL	HRSL full build with all unit test fixes | PHASE GARBAGE: global_phase = 0x0100008160902101 across 64 live shots (must be 0)
 1776598720	8c7839d	4351164.000	22315498.998	2997	29798803	OK	revert HRSL wiring, restore baseline
 1776599625	449d3dd	4351164.000	22315498.998	2997	29798803	OK	iter 47 baseline confirm
+1776601546	a964340	4351164.000	22315498.998	2997	29798803	OK	iter 72 baseline confirm
