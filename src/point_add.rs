@@ -4650,29 +4650,16 @@ pub fn build() -> Vec<Op> {
 
     let lam = b.alloc_qubits(N);
 
-    // EXPERIMENT: Montgomery batched inversion with correct quantum Px.
-    // At this point, tx holds dx (= Px - Qx). We need Px quantum, which we
-    // recover as px_q = dx + Qx.
-    let _ = (K1, STEP0_SKIP_1);
-    let _ = (K2, STEP0_SKIP_2);
-    const K_MONT: usize = 2 * N - 1;
-    let px_q = b.alloc_qubits(N);
-    for i in 0..N { b.cx(tx[i], px_q[i]); }  // px_q = dx
-    mod_add_qb(b, &px_q, &ox, p);            // px_q = dx + Qx = Px
-
-    with_mont_inv_quantum_px(b, &tx, &ty, &px_q, &ox, p, K_MONT, |b, dx_inv, _rqx_inv| {
-        // Compute lam = ty · dx_inv (= λ).
-        let tmp_lo = b.alloc_qubits(2 * N);
-        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &lam, &ty, dx_inv, p, &tmp_lo);
-        mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_lo);
-        mod_mul_sub_from_acc_karatsuba_with_tmp_ext(b, &lam, &ty, dx_inv, p, &tmp_lo);
+    // Pair 1: baseline Kaliski.
+    with_kal_inv_raw_scratch(b, &tx, p, K1, STEP0_SKIP_1, |b, inv_raw, scratch| {
+        let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
+        let mut tmp_ext = tmp_lo.clone();
+        tmp_ext.extend_from_slice(scratch);
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &lam, &ty, inv_raw, p, &tmp_ext);
+        for _ in 0..K1 { mod_halve_inplace_fast(b, &lam, p); }
+        mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_ext);
         b.free_vec(&tmp_lo);
     });
-
-    // Uncompute px_q: reverse of the setup.
-    mod_sub_qb(b, &px_q, &ox, p);  // px_q = dx
-    for i in 0..N { b.cx(tx[i], px_q[i]); }  // px_q = 0
-    b.free_vec(&px_q);
 
     // Px := λ² - Px_orig - Qx. Rearranged: tx = dx - λ². Add 2Qx, then
     // negate: -(dx - λ² + 2Qx) = λ² - dx - 2Qx = Rx. mod_add_qb is
@@ -4683,8 +4670,16 @@ pub fn build() -> Vec<Op> {
     // cheaper than mod_sub_qb by n CCX. Result equivalent: tx = Rx - Qx.
     mod_add_qb(b, &tx, &ox, p);                          // tx = dx - λ² + 3Qx
     mod_neg_inplace_fast(b, &tx, p);                     // tx = -(...)= Rx - Qx
-    // Pair 2 also becomes a no-op for this experiment; all we're measuring is Mont cost.
-    let _ = &lam;
+    with_kal_inv_raw_scratch(b, &tx, p, K2, STEP0_SKIP_2, |b, inv_raw, scratch| {
+        let tmp_lo = b.alloc_qubits(2 * N - scratch.len());
+        let mut tmp_ext = tmp_lo.clone();
+        tmp_ext.extend_from_slice(scratch);
+        mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, &ty, &lam, &tx, p, &tmp_ext);
+        for _ in 0..K2 { mod_double_inplace_fast(b, &lam, p); }
+        mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, &lam, inv_raw, &ty, p, &tmp_ext);
+        mod_sub_qb(b, &ty, &oy, p);
+        b.free_vec(&tmp_lo);
+    });
     mod_add_qb(b, &tx, &ox, p);                           // tx = Rx
 
     b.free_vec(&lam);
