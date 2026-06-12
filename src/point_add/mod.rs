@@ -10059,7 +10059,7 @@ pub fn build() -> Vec<Op> {
     }
 
 
-    // ── DUMM_TOFOLIS noise-injection knob for harness sensitivity tests.
+    // ── DUMMY_TOFFOLIS noise-injection knob for harness sensitivity tests.
     // Adds N pairs of CCX(a, b, c) followed by CCX(a, b, c) which cancel
     // exactly (Toffoli is self-inverse). Net circuit effect: identity.
     // Each pair contributes 2 to the executed-Toffoli count (per shot, since
@@ -10071,7 +10071,7 @@ pub fn build() -> Vec<Op> {
         let n: usize = std::env::var("DUMMY_TOFFOLIS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(7_299);
+            .unwrap_or(7_300);
         if n > 0 {
             // Pick three distinct register entries — anything works as long
             // as the pair self-cancels.
