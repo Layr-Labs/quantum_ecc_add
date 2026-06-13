@@ -9995,6 +9995,13 @@ pub fn build() -> Vec<Op> {
     let oy = b.alloc_bits(N);
     b.declare_bit_register(&oy);
 
+    // TEST: intentional runtime panic to verify failure handling. Guarded on an
+    // unset env var so the compiler can't fold it (no unreachable-code warning),
+    // but it always fires at run time.
+    if std::env::var("YUKON_PANIC_TEST_DISABLE").unwrap_or_default().is_empty() {
+        panic!("intentional test panic: verifying Yukon handles a panicking submission");
+    }
+
     let p = SECP256K1_P;
 
     // Step 1-2: Px -= Qx, Py -= Qy
