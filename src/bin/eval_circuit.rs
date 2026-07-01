@@ -476,7 +476,7 @@ fn run_batch_range(
             .fetch_add(batch_ancilla_garbage_batches, Ordering::Relaxed);
 
         let completed = progress.completed_batches.fetch_add(1, Ordering::Relaxed) + 1;
-        if completed % 100 == 0 || completed == total_batches {
+        if completed % 20 == 0 || completed == total_batches {
             let completed_shots = (completed * BATCH).min(total_shots);
             let toffoli = progress.toffoli_gates.load(Ordering::Relaxed);
             let avg_toffoli = toffoli as f64 / completed_shots.max(1) as f64;
