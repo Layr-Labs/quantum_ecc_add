@@ -8,12 +8,6 @@ artifact is cheap and reproducible, but it gives contestants a fixed target:
 they can keep changing `ops.bin` until the derived sample set misses the
 circuit's bad inputs.
 
-We do not have the same proof-generation cost constraint here, so the trusted
-evaluator chooses fresh OS randomness after `ops.bin` exists and mixes it with
-`hash(ops.bin)`. The printed sample seed still makes a finished run
-reproducible, but the sample stream is not available while the untrusted circuit
-is being generated.
-
 The previous local gate accepted only circuits with zero classical failures on
 9024 sampled inputs. That was a compact way to make a 99%-correct circuit
 unlikely to pass if the samples were not grindable:
