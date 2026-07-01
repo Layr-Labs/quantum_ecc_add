@@ -16,10 +16,12 @@ use quantum_ecc::circuit::{
 };
 use quantum_ecc::sim::Simulator;
 use quantum_ecc::weierstrass_elliptic_curve::WeierstrassEllipticCurve;
+use rand::{rngs::OsRng, TryRngCore};
 use sha3::{
     digest::{ExtendableOutput, Update, XofReader},
     Shake256,
 };
+use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::process::Command;
@@ -42,7 +44,11 @@ const OP_BYTES: usize = OP_FIELDS * FIELD_BYTES;
 // Real circuits sit ~3k qubits and a few hundred million ops; caps are
 // generous compared to that.
 const MAX_OPS: u64 = 4_000_000_000;
-const NUM_TESTS: usize = 9024;
+const NUM_TESTS: usize = 100_000;
+// Largest cutoff with Pr[Binomial(100000, 0.01) <= cutoff] <= 2^-128.
+// This preserves the old anti-grinding standard while allowing approximate
+// circuits that are much better than 99% correct to pass the pre-promotion gate.
+const MAX_SAMPLED_FAILURES: usize = 617;
 
 // ─── Bounded ops.bin loader ────────────────────────────────────────────────
 //
@@ -124,8 +130,8 @@ fn load_ops(path: &str) -> Result<Vec<Op>, String> {
         dec.read_exact(&mut rec)
             .map_err(|e| format!("op {i}: short read from compressed body: {e}"))?;
         let kind_raw = u32::from_le_bytes(rec[0..4].try_into().unwrap());
-        let kind = op_kind_from_u32(kind_raw)
-            .ok_or_else(|| format!("op {i}: unknown kind {kind_raw}"))?;
+        let kind =
+            op_kind_from_u32(kind_raw).ok_or_else(|| format!("op {i}: unknown kind {kind_raw}"))?;
         // rec[4..8] are reserved padding for 8-byte alignment.
         let q_control2 = QubitId(read_u64(&rec, 8));
         let q_control1 = QubitId(read_u64(&rec, 16));
@@ -196,24 +202,43 @@ fn secp256k1() -> WeierstrassEllipticCurve {
     }
 }
 
-// ─── Fiat-Shamir seed ──────────────────────────────────────────────────────
+// ─── Trusted random seed ───────────────────────────────────────────────────
 //
-// SHAKE256 over the op stream. Determines test inputs, simulator RNG for
-// R/Hmr phase randomization, etc.
+// SHAKE256 expands the sample seed plus the hash of raw ops.bin bytes into test
+// inputs and simulator RNG for R/Hmr phase randomization. When no seed is
+// provided, the printed sample seed is itself derived as H(os_rng || ops_hash).
+// The OS randomness is chosen after ops.bin exists, so contestant code cannot
+// know the final sample stream while building the artifact.
 
-fn fiat_shamir_seed(ops: &[Op]) -> sha3::Shake256Reader {
+fn hash_ops_bin(ops_path: &str) -> Result<[u8; 32], String> {
     let mut hasher = Shake256::default();
-    hasher.update(b"quantum_ecc-fiat-shamir-v2");
-    hasher.update(&(ops.len() as u64).to_le_bytes());
-    for op in ops {
-        hasher.update(&[op.kind as u8]);
-        hasher.update(&op.q_control2.0.to_le_bytes());
-        hasher.update(&op.q_control1.0.to_le_bytes());
-        hasher.update(&op.q_target.0.to_le_bytes());
-        hasher.update(&op.c_target.0.to_le_bytes());
-        hasher.update(&op.c_condition.0.to_le_bytes());
-        hasher.update(&op.r_target.0.to_le_bytes());
+    hasher.update(b"quantum_ecc-ops-bin-hash-v1");
+
+    let mut file = File::open(ops_path).map_err(|e| format!("open {ops_path} for RNG: {e}"))?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("read {ops_path} for RNG: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
     }
+
+    let mut reader = hasher.finalize_xof();
+    let mut hash = [0u8; 32];
+    XofReader::read(&mut reader, &mut hash);
+    Ok(hash)
+}
+
+fn trusted_random_xof(sample_seed: &str, ops_hash: &[u8; 32]) -> sha3::Shake256Reader {
+    let mut hasher = Shake256::default();
+    hasher.update(b"quantum_ecc-trusted-random-v3");
+    hasher.update(&(sample_seed.len() as u64).to_le_bytes());
+    hasher.update(sample_seed.as_bytes());
+    hasher.update(b"ops_hash");
+    hasher.update(ops_hash);
     hasher.finalize_xof()
 }
 
@@ -226,7 +251,10 @@ struct SeedReport {
     tot_tof: u64,
     tot_cliff: u64,
     n_shots: usize,
+    max_sampled_failures: usize,
+    sampled_failures: usize,
     classical_failures: usize,
+    phase_failures: usize,
     phase_garbage_batches: usize,
     ancilla_garbage_batches: usize,
     fail_reason: Option<String>,
@@ -245,7 +273,7 @@ fn run_tests(
     let mut targets = Vec::with_capacity(target_shots);
     let mut offsets = Vec::with_capacity(target_shots);
     let mut expected = Vec::with_capacity(target_shots);
-    for _ in 0..target_shots {
+    while targets.len() < target_shots {
         let mut rb = [[0u8; 32]; 2];
         // Disambiguate from std::io::Read (in scope for the zstd loader).
         XofReader::read(&mut xof, &mut rb[0]);
@@ -271,9 +299,13 @@ fn run_tests(
     let n = targets.len();
 
     let mut sim = Simulator::new(total_qubits as usize, num_bits as usize, &mut xof);
-    let mut ok = true;
+    let mut ancilla_ok = true;
     let mut fail_reason: Option<String> = None;
+    let mut first_classical_mismatch: Option<String> = None;
+    let mut first_phase_garbage: Option<String> = None;
+    let mut sampled_failures = 0usize;
     let mut classical_failures = 0usize;
+    let mut phase_failures = 0usize;
     let mut phase_garbage_batches = 0usize;
     let mut ancilla_garbage_batches = 0usize;
 
@@ -294,34 +326,36 @@ fn run_tests(
 
         sim.apply_iter(ops.iter());
 
+        let mut sampled_failure_mask = 0u64;
         for shot in 0..bs {
             let i = batch * BATCH + shot;
             let gx = sim.get_register(&layout_regs[0], shot);
             let gy = sim.get_register(&layout_regs[1], shot);
             if gx != expected[i].0 || gy != expected[i].1 {
                 classical_failures += 1;
-                if fail_reason.is_none() {
-                    fail_reason = Some(format!(
+                sampled_failure_mask |= 1u64 << shot;
+                if first_classical_mismatch.is_none() {
+                    first_classical_mismatch = Some(format!(
                         "CLASSICAL MISMATCH shot {i}: got ({:#x},{:#x}) exp ({:#x},{:#x})",
                         gx, gy, expected[i].0, expected[i].1
                     ));
                 }
-                ok = false;
             }
         }
 
         let phase = sim.phase & cond_mask;
         if phase != 0 {
             phase_garbage_batches += 1;
-            let msg = format!(
-                "PHASE GARBAGE: global_phase = {:#018x} across {} live shots (must be 0)",
-                phase, bs
-            );
-            if fail_reason.is_none() {
-                fail_reason = Some(msg);
+            phase_failures += phase.count_ones() as usize;
+            sampled_failure_mask |= phase;
+            if first_phase_garbage.is_none() {
+                first_phase_garbage = Some(format!(
+                    "PHASE GARBAGE batch {batch}: global_phase = {:#018x} across {} live shots",
+                    phase, bs
+                ));
             }
-            ok = false;
         }
+        sampled_failures += sampled_failure_mask.count_ones() as usize;
 
         for register in layout_regs {
             for qb in register {
@@ -349,20 +383,36 @@ fn run_tests(
             if fail_reason.is_none() {
                 fail_reason = Some(msg);
             }
-            ok = false;
+            ancilla_ok = false;
         }
     }
 
     let _ = num_bits;
     let denom = n.max(1) as f64;
+    let sampled_ok = sampled_failures <= MAX_SAMPLED_FAILURES;
+    if !sampled_ok && fail_reason.is_none() {
+        let classical_detail = first_classical_mismatch
+            .map(|s| format!("; first classical mismatch: {s}"))
+            .unwrap_or_default();
+        let phase_detail = first_phase_garbage
+            .map(|s| format!("; first phase garbage: {s}"))
+            .unwrap_or_default();
+        fail_reason = Some(format!(
+            "SAMPLED FAILURES: {} > {} allowed over {} shots{}{}",
+            sampled_failures, MAX_SAMPLED_FAILURES, n, classical_detail, phase_detail
+        ));
+    }
     SeedReport {
-        ok,
+        ok: ancilla_ok && sampled_ok,
         avg_cliff: sim.stats.clifford_gates as f64 / denom,
         avg_tof: sim.stats.toffoli_gates as f64 / denom,
         tot_tof: sim.stats.toffoli_gates,
         tot_cliff: sim.stats.clifford_gates,
         n_shots: n,
+        max_sampled_failures: MAX_SAMPLED_FAILURES,
+        sampled_failures,
         classical_failures,
+        phase_failures,
         phase_garbage_batches,
         ancilla_garbage_batches,
         fail_reason,
@@ -371,9 +421,15 @@ fn run_tests(
 
 // ─── Output bookkeeping ────────────────────────────────────────────────────
 
-fn parse_note() -> String {
+struct EvalArgs {
+    note: String,
+    sample_seed: Option<String>,
+}
+
+fn parse_args() -> Result<EvalArgs, String> {
     let mut args = std::env::args().skip(1);
     let mut note = String::new();
+    let mut sample_seed: Option<String> = None;
     while let Some(a) = args.next() {
         if a == "--note" {
             if let Some(v) = args.next() {
@@ -381,9 +437,57 @@ fn parse_note() -> String {
             }
         } else if let Some(rest) = a.strip_prefix("--note=") {
             note = rest.to_string();
+        } else if a == "--sample-seed" {
+            let v = args
+                .next()
+                .ok_or_else(|| "--sample-seed requires a value".to_string())?;
+            if v.is_empty() {
+                return Err("--sample-seed must not be empty".to_string());
+            }
+            sample_seed = Some(v);
+        } else if let Some(rest) = a.strip_prefix("--sample-seed=") {
+            if rest.is_empty() {
+                return Err("--sample-seed must not be empty".to_string());
+            }
+            sample_seed = Some(rest.to_string());
         }
     }
-    note.replace('\t', " ").replace('\n', " ")
+    Ok(EvalArgs {
+        note: note.replace('\t', " ").replace('\n', " "),
+        sample_seed,
+    })
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(&mut s, "{b:02x}").unwrap();
+    }
+    s
+}
+
+fn choose_sample_seed(
+    arg_seed: Option<String>,
+    ops_hash: &[u8; 32],
+) -> Result<(String, &'static str), String> {
+    if let Some(seed) = arg_seed {
+        return Ok((seed.replace('\t', " ").replace('\n', " "), "command line"));
+    }
+
+    let mut os_seed = [0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut os_seed)
+        .map_err(|e| format!("could not read trusted sample seed from OS CSPRNG: {e}"))?;
+
+    let mut hasher = Shake256::default();
+    hasher.update(b"quantum_ecc-generated-sample-seed-v1");
+    hasher.update(&os_seed);
+    hasher.update(ops_hash);
+    let mut reader = hasher.finalize_xof();
+    let mut seed = [0u8; 32];
+    XofReader::read(&mut reader, &mut seed);
+
+    Ok((hex_encode(&seed), "trusted random + ops hash"))
 }
 
 fn git_commit_short() -> String {
@@ -429,6 +533,14 @@ fn append_results_row(
     }
 }
 
+fn note_with_sample_seed(note: &str, sample_seed: &str) -> String {
+    if note.is_empty() {
+        format!("sample_seed={sample_seed}")
+    } else {
+        format!("{note} | sample_seed={sample_seed}")
+    }
+}
+
 fn write_score(avg_tof: f64, qubits: u64) {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/score.json");
     let toffoli = avg_tof.round() as u64;
@@ -453,7 +565,14 @@ fn fail_and_exit(reason: &str, note: &str, ops_len: usize, total_qubits: u64) ->
 }
 
 fn main() {
-    let note = parse_note();
+    let args = match parse_args() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("!! argument error: {e}");
+            std::process::exit(2);
+        }
+    };
+    let note = args.note;
     println!("=== quantum_ecc: eval_circuit (trusted stage) ===\n");
 
     let ops = match load_ops(OPS_PATH) {
@@ -465,6 +584,23 @@ fn main() {
         }
     };
     println!("  loaded ops  : {}", ops.len());
+
+    let ops_hash = match hash_ops_bin(OPS_PATH) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("!! {e}");
+            append_results_row("FAIL", 0.0, 0.0, 0, ops.len(), &format!("{note} | {e}"));
+            std::process::exit(1);
+        }
+    };
+    let (sample_seed, sample_seed_source) = match choose_sample_seed(args.sample_seed, &ops_hash) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("!! {e}");
+            append_results_row("FAIL", 0.0, 0.0, 0, ops.len(), &format!("{note} | {e}"));
+            std::process::exit(2);
+        }
+    };
 
     let (total_qubits, num_bits, _num_regs, regs) = analyze_ops(ops.iter());
 
@@ -509,18 +645,29 @@ fn main() {
 
     println!("  qubits      : {}", total_qubits);
     println!("  bits        : {}", num_bits);
+    println!("  sample seed : {} ({})", sample_seed, sample_seed_source);
 
     println!("\n-- correctness tests ({} shots) --", NUM_TESTS);
-    let xof = fiat_shamir_seed(&ops);
+    println!(
+        "  sampled pass bound     : <= {} classical/phase failures",
+        MAX_SAMPLED_FAILURES
+    );
+    let xof = trusted_random_xof(&sample_seed, &ops_hash);
     let r = run_tests(&ops, &regs, total_qubits, num_bits, xof, NUM_TESTS);
     println!("  tested shots            : {}", r.n_shots);
+    println!("  sampled failures        : {}", r.sampled_failures);
     println!("  classical mismatches    : {}", r.classical_failures);
+    println!("  phase-failed shots      : {}", r.phase_failures);
+    println!("  sampled allowance       : {}", r.max_sampled_failures);
     println!("  phase-garbage batches   : {}", r.phase_garbage_batches);
     println!("  ancilla-garbage batches : {}", r.ancilla_garbage_batches);
     if !r.ok {
-        let reason = r.fail_reason.clone().unwrap_or_else(|| "(no detail)".into());
+        let reason = r
+            .fail_reason
+            .clone()
+            .unwrap_or_else(|| "(no detail)".into());
         println!("\n!! correctness FAILED: {reason}");
-        let fail_note = format!("{note} | {reason}");
+        let fail_note = format!("{} | {reason}", note_with_sample_seed(&note, &sample_seed));
         append_results_row(
             "FAIL",
             r.avg_tof,
@@ -531,7 +678,10 @@ fn main() {
         );
         std::process::exit(1);
     }
-    println!("  all {} shots OK", r.n_shots);
+    println!(
+        "  statistical correctness OK ({} <= {})",
+        r.sampled_failures, r.max_sampled_failures
+    );
 
     println!("\n=== circuit metrics (secp256k1, n=256) ===");
     println!("  avg executed Toffoli  : {:.3}", r.avg_tof);
@@ -544,7 +694,15 @@ fn main() {
     println!("  emitted ops           : {}", ops.len());
     println!("  qubits                : {}", total_qubits);
 
-    append_results_row("OK", r.avg_tof, r.avg_cliff, total_qubits, ops.len(), &note);
+    let result_note = note_with_sample_seed(&note, &sample_seed);
+    append_results_row(
+        "OK",
+        r.avg_tof,
+        r.avg_cliff,
+        total_qubits,
+        ops.len(),
+        &result_note,
+    );
     write_score(r.avg_tof, total_qubits);
 
     println!("\n=== experiment OK ===");

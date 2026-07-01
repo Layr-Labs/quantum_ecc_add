@@ -31,9 +31,13 @@ You are given a Rust harness that:
    `offset_y` (classical bits) — and overwrite `(target_x, target_y)`
    with the affine sum `(target_x, target_y) + (offset_x, offset_y)` on
    the secp256k1 curve.
-2. **Validates** the circuit by simulating it on 9024 random test points.
-   Inputs are derived from a Fiat-Shamir hash of your op stream, so you
-   cannot tune the circuit against the test set.
+2. **Validates** the circuit by simulating it on 100,000 random test points.
+   Inputs are derived from `hash(ops.bin)` and a trusted random seed chosen
+   inside `eval_circuit` after `ops.bin` exists. If no seed is supplied, the
+   printed seed is derived as `hash(osrng || hash(ops.bin))`, so the circuit
+   cannot know its final test set while building. Pass the printed seed back to
+   `eval_circuit` with `--sample-seed` to reproduce the same sample set for the
+   same `ops.bin`.
 3. **Counts** every Toffoli, every Clifford, and the peak number of live
    qubits.
 4. **Scores** the run as
@@ -47,19 +51,19 @@ You are given a Rust harness that:
 
 A run is rejected if any of the following fails:
 
-- **Classical correctness.** All 9024 shots must produce the right
-  `(R_x, R_y)`.
-- **Reversibility.** Every ancilla qubit must be uncomputed to $|0\rangle$
+- **Sampled output/phase correctness.** At most 617 of the 100,000 shots may
+  have either an incorrect `(R_x, R_y)` or leftover global phase. A shot with
+  both issues is counted once. This keeps the probability that a 99%-correct
+  circuit passes below $2^{-128}$ while allowing high-correctness approximate
+  circuits to reach the promotion test.
+- **Ancilla cleanup.** Every ancilla qubit must be uncomputed to $|0\rangle$
   before being freed. `sim.rs` enforces this on every freed qubit. After
   the forward pass, every non-output qubit must again be $|0\rangle$.
-- **Phase cleanliness.** The global phase across all live shots must be
-  zero — no leftover phase kickback from a sloppy uncomputation.
 - **Forward∘reverse identity.** Running the circuit and then its gate-
   reversed inverse must restore the original state on every qubit.
 
 There are no loopholes. A "Toffoli win" that comes from skipping
-uncomputation, leaking phase, or writing garbage to ancilla makes the
-run fail, not faster.
+uncomputation or writing garbage to ancilla makes the run fail, not faster.
 
 ### Reference numbers
 
