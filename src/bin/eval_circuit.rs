@@ -25,6 +25,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const OPS_PATH: &str = "ops.bin";
@@ -44,11 +45,11 @@ const OP_BYTES: usize = OP_FIELDS * FIELD_BYTES;
 // Real circuits sit ~3k qubits and a few hundred million ops; caps are
 // generous compared to that.
 const MAX_OPS: u64 = 4_000_000_000;
-const NUM_TESTS: usize = 100_000;
-// Largest cutoff with Pr[Binomial(100000, 0.01) <= cutoff] <= 2^-128.
+const NUM_TESTS: usize = 50_048;
+// Largest cutoff with Pr[Binomial(50048, 0.01) <= cutoff] <= 2^-128.
 // This preserves the old anti-grinding standard while allowing approximate
 // circuits that are much better than 99% correct to pass the pre-promotion gate.
-const MAX_SAMPLED_FAILURES: usize = 617;
+const MAX_SAMPLED_FAILURES: usize = 238;
 
 // ─── Bounded ops.bin loader ────────────────────────────────────────────────
 //
@@ -322,6 +323,30 @@ impl BatchReport {
     }
 }
 
+struct ProgressCounters {
+    completed_batches: AtomicUsize,
+    toffoli_gates: AtomicU64,
+    sampled_failures: AtomicUsize,
+    classical_failures: AtomicUsize,
+    phase_failures: AtomicUsize,
+    phase_garbage_batches: AtomicUsize,
+    ancilla_garbage_batches: AtomicUsize,
+}
+
+impl ProgressCounters {
+    fn new() -> Self {
+        Self {
+            completed_batches: AtomicUsize::new(0),
+            toffoli_gates: AtomicU64::new(0),
+            sampled_failures: AtomicUsize::new(0),
+            classical_failures: AtomicUsize::new(0),
+            phase_failures: AtomicUsize::new(0),
+            phase_garbage_batches: AtomicUsize::new(0),
+            ancilla_garbage_batches: AtomicUsize::new(0),
+        }
+    }
+}
+
 fn run_batch_range(
     ops: &[Op],
     layout_regs: &[Vec<QubitOrBit>],
@@ -334,6 +359,9 @@ fn run_batch_range(
     ops_hash: &[u8; 32],
     batch_start: usize,
     batch_end: usize,
+    total_batches: usize,
+    total_shots: usize,
+    progress: &ProgressCounters,
 ) -> BatchReport {
     const BATCH: usize = 64;
 
@@ -356,15 +384,19 @@ fn run_batch_range(
             sim.set_register(&layout_regs[3], offsets[i].1, shot);
         }
 
+        let toffoli_before = sim.stats.toffoli_gates;
         sim.apply_iter(ops.iter());
+        let batch_toffoli = sim.stats.toffoli_gates - toffoli_before;
 
         let mut sampled_failure_mask = 0u64;
+        let mut batch_classical_failures = 0usize;
         for shot in 0..bs {
             let i = batch * BATCH + shot;
             let gx = sim.get_register(&layout_regs[0], shot);
             let gy = sim.get_register(&layout_regs[1], shot);
             if gx != expected[i].0 || gy != expected[i].1 {
                 report.classical_failures += 1;
+                batch_classical_failures += 1;
                 sampled_failure_mask |= 1u64 << shot;
                 if report.first_classical_mismatch.is_none() {
                     report.first_classical_mismatch = Some(format!(
@@ -376,9 +408,13 @@ fn run_batch_range(
         }
 
         let phase = sim.phase & cond_mask;
+        let mut batch_phase_failures = 0usize;
+        let mut batch_phase_garbage_batches = 0usize;
         if phase != 0 {
             report.phase_garbage_batches += 1;
             report.phase_failures += phase.count_ones() as usize;
+            batch_phase_failures = phase.count_ones() as usize;
+            batch_phase_garbage_batches = 1;
             sampled_failure_mask |= phase;
             if report.first_phase_garbage.is_none() {
                 report.first_phase_garbage = Some(format!(
@@ -387,7 +423,8 @@ fn run_batch_range(
                 ));
             }
         }
-        report.sampled_failures += sampled_failure_mask.count_ones() as usize;
+        let batch_sampled_failures = sampled_failure_mask.count_ones() as usize;
+        report.sampled_failures += batch_sampled_failures;
 
         for register in layout_regs {
             for qb in register {
@@ -404,8 +441,10 @@ fn run_batch_range(
                 break;
             }
         }
+        let mut batch_ancilla_garbage_batches = 0usize;
         if let Some(q) = garbage_q {
             report.ancilla_garbage_batches += 1;
+            batch_ancilla_garbage_batches = 1;
             let v = sim.qubit(QubitId(q)) & cond_mask;
             let msg = format!(
                 "ANCILLA GARBAGE: qubit {} = {:#018x} (live shots) at end of forward; \
@@ -415,6 +454,45 @@ fn run_batch_range(
             if report.fail_reason.is_none() {
                 report.fail_reason = Some(msg);
             }
+        }
+
+        progress
+            .toffoli_gates
+            .fetch_add(batch_toffoli, Ordering::Relaxed);
+        progress
+            .sampled_failures
+            .fetch_add(batch_sampled_failures, Ordering::Relaxed);
+        progress
+            .classical_failures
+            .fetch_add(batch_classical_failures, Ordering::Relaxed);
+        progress
+            .phase_failures
+            .fetch_add(batch_phase_failures, Ordering::Relaxed);
+        progress
+            .phase_garbage_batches
+            .fetch_add(batch_phase_garbage_batches, Ordering::Relaxed);
+        progress
+            .ancilla_garbage_batches
+            .fetch_add(batch_ancilla_garbage_batches, Ordering::Relaxed);
+
+        let completed = progress.completed_batches.fetch_add(1, Ordering::Relaxed) + 1;
+        if completed % 100 == 0 || completed == total_batches {
+            let completed_shots = (completed * BATCH).min(total_shots);
+            let toffoli = progress.toffoli_gates.load(Ordering::Relaxed);
+            let avg_toffoli = toffoli as f64 / completed_shots.max(1) as f64;
+            let sampled = progress.sampled_failures.load(Ordering::Relaxed);
+            let classical = progress.classical_failures.load(Ordering::Relaxed);
+            let phase = progress.phase_failures.load(Ordering::Relaxed);
+            let phase_batches = progress.phase_garbage_batches.load(Ordering::Relaxed);
+            let ancilla_batches = progress.ancilla_garbage_batches.load(Ordering::Relaxed);
+            eprintln!(
+                "  progress: {completed}/{total_batches} batches complete \
+                 ({completed_shots}/{total_shots} shots); qubits={total_qubits} \
+                 avg_toffoli={avg_toffoli:.3}; \
+                 failures sampled={sampled}/{MAX_SAMPLED_FAILURES} \
+                 classical={classical} phase={phase} \
+                 phase_batches={phase_batches} ancilla_batches={ancilla_batches}"
+            );
         }
     }
 
@@ -473,6 +551,7 @@ fn run_tests(
     let targets_ref = &targets;
     let offsets_ref = &offsets;
     let expected_ref = &expected;
+    let progress = ProgressCounters::new();
     let mut reports = Vec::new();
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -483,6 +562,7 @@ fn run_tests(
                 continue;
             }
 
+            let progress = &progress;
             handles.push(scope.spawn(move || {
                 run_batch_range(
                     ops,
@@ -496,6 +576,9 @@ fn run_tests(
                     ops_hash,
                     batch_start,
                     batch_end,
+                    num_batches,
+                    n,
+                    progress,
                 )
             }));
         }

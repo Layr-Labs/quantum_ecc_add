@@ -31,7 +31,8 @@ You are given a Rust harness that:
    `offset_y` (classical bits) — and overwrite `(target_x, target_y)`
    with the affine sum `(target_x, target_y) + (offset_x, offset_y)` on
    the secp256k1 curve.
-2. **Validates** the circuit by simulating it on 100,000 random test points.
+2. **Validates** the circuit by simulating it on 50,048 random test points
+   (782 full 64-shot batches, just over 50k).
    Inputs are derived from `hash(ops.bin)` and a trusted random seed chosen
    inside `eval_circuit` after `ops.bin` exists. If no seed is supplied, the
    printed seed is derived as `hash(osrng || hash(ops.bin))`, so the circuit
@@ -51,7 +52,7 @@ You are given a Rust harness that:
 
 A run is rejected if any of the following fails:
 
-- **Sampled output/phase correctness.** At most 617 of the 100,000 shots may
+- **Sampled output/phase correctness.** At most 238 of the 50,048 shots may
   have either an incorrect `(R_x, R_y)` or leftover global phase. A shot with
   both issues is counted once. This keeps the probability that a 99%-correct
   circuit passes below $2^{-128}$ while allowing high-correctness approximate
