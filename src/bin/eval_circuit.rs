@@ -242,6 +242,38 @@ fn trusted_random_xof(sample_seed: &str, ops_hash: &[u8; 32]) -> sha3::Shake256R
     hasher.finalize_xof()
 }
 
+fn batch_random_xof(sample_seed: &str, ops_hash: &[u8; 32], batch: usize) -> sha3::Shake256Reader {
+    let mut hasher = Shake256::default();
+    hasher.update(b"quantum_ecc-batch-random-v1");
+    hasher.update(&(sample_seed.len() as u64).to_le_bytes());
+    hasher.update(sample_seed.as_bytes());
+    hasher.update(ops_hash);
+    hasher.update(&(batch as u64).to_le_bytes());
+    hasher.finalize_xof()
+}
+
+struct BatchXof {
+    reader: sha3::Shake256Reader,
+}
+
+impl BatchXof {
+    fn new(sample_seed: &str, ops_hash: &[u8; 32], batch: usize) -> Self {
+        Self {
+            reader: batch_random_xof(sample_seed, ops_hash, batch),
+        }
+    }
+
+    fn reset(&mut self, sample_seed: &str, ops_hash: &[u8; 32], batch: usize) {
+        self.reader = batch_random_xof(sample_seed, ops_hash, batch);
+    }
+}
+
+impl XofReader for BatchXof {
+    fn read(&mut self, buffer: &mut [u8]) {
+        XofReader::read(&mut self.reader, buffer);
+    }
+}
+
 // ─── Test runner ──────────────────────────────────────────────────────────
 
 struct SeedReport {
@@ -260,12 +292,145 @@ struct SeedReport {
     fail_reason: Option<String>,
 }
 
+struct BatchReport {
+    tot_tof: u64,
+    tot_cliff: u64,
+    sampled_failures: usize,
+    classical_failures: usize,
+    phase_failures: usize,
+    phase_garbage_batches: usize,
+    ancilla_garbage_batches: usize,
+    fail_reason: Option<String>,
+    first_classical_mismatch: Option<String>,
+    first_phase_garbage: Option<String>,
+}
+
+impl BatchReport {
+    fn new() -> Self {
+        Self {
+            tot_tof: 0,
+            tot_cliff: 0,
+            sampled_failures: 0,
+            classical_failures: 0,
+            phase_failures: 0,
+            phase_garbage_batches: 0,
+            ancilla_garbage_batches: 0,
+            fail_reason: None,
+            first_classical_mismatch: None,
+            first_phase_garbage: None,
+        }
+    }
+}
+
+fn run_batch_range(
+    ops: &[Op],
+    layout_regs: &[Vec<QubitOrBit>],
+    total_qubits: u64,
+    num_bits: u64,
+    targets: &[(U256, U256)],
+    offsets: &[(U256, U256)],
+    expected: &[(U256, U256)],
+    sample_seed: &str,
+    ops_hash: &[u8; 32],
+    batch_start: usize,
+    batch_end: usize,
+) -> BatchReport {
+    const BATCH: usize = 64;
+
+    let mut report = BatchReport::new();
+    let mut batch_xof = BatchXof::new(sample_seed, ops_hash, batch_start);
+    let mut sim = Simulator::new(total_qubits as usize, num_bits as usize, &mut batch_xof);
+
+    for batch in batch_start..batch_end {
+        sim.xof.reset(sample_seed, ops_hash, batch);
+
+        let bs = BATCH.min(targets.len() - batch * BATCH);
+        let cond_mask: u64 = if bs == 64 { u64::MAX } else { (1u64 << bs) - 1 };
+
+        sim.clear_for_shot();
+        for shot in 0..bs {
+            let i = batch * BATCH + shot;
+            sim.set_register(&layout_regs[0], targets[i].0, shot);
+            sim.set_register(&layout_regs[1], targets[i].1, shot);
+            sim.set_register(&layout_regs[2], offsets[i].0, shot);
+            sim.set_register(&layout_regs[3], offsets[i].1, shot);
+        }
+
+        sim.apply_iter(ops.iter());
+
+        let mut sampled_failure_mask = 0u64;
+        for shot in 0..bs {
+            let i = batch * BATCH + shot;
+            let gx = sim.get_register(&layout_regs[0], shot);
+            let gy = sim.get_register(&layout_regs[1], shot);
+            if gx != expected[i].0 || gy != expected[i].1 {
+                report.classical_failures += 1;
+                sampled_failure_mask |= 1u64 << shot;
+                if report.first_classical_mismatch.is_none() {
+                    report.first_classical_mismatch = Some(format!(
+                        "CLASSICAL MISMATCH shot {i}: got ({:#x},{:#x}) exp ({:#x},{:#x})",
+                        gx, gy, expected[i].0, expected[i].1
+                    ));
+                }
+            }
+        }
+
+        let phase = sim.phase & cond_mask;
+        if phase != 0 {
+            report.phase_garbage_batches += 1;
+            report.phase_failures += phase.count_ones() as usize;
+            sampled_failure_mask |= phase;
+            if report.first_phase_garbage.is_none() {
+                report.first_phase_garbage = Some(format!(
+                    "PHASE GARBAGE batch {batch}: global_phase = {:#018x} across {} live shots",
+                    phase, bs
+                ));
+            }
+        }
+        report.sampled_failures += sampled_failure_mask.count_ones() as usize;
+
+        for register in layout_regs {
+            for qb in register {
+                if let QubitOrBit::Qubit(q) = *qb {
+                    *sim.qubit_mut(q) = 0;
+                }
+            }
+        }
+        let mut garbage_q: Option<u64> = None;
+        for q in 0..total_qubits {
+            let v = sim.qubit(QubitId(q)) & cond_mask;
+            if v != 0 {
+                garbage_q = Some(q);
+                break;
+            }
+        }
+        if let Some(q) = garbage_q {
+            report.ancilla_garbage_batches += 1;
+            let v = sim.qubit(QubitId(q)) & cond_mask;
+            let msg = format!(
+                "ANCILLA GARBAGE: qubit {} = {:#018x} (live shots) at end of forward; \
+                 every non-register qubit must be |0⟩ on every live shot",
+                q, v
+            );
+            if report.fail_reason.is_none() {
+                report.fail_reason = Some(msg);
+            }
+        }
+    }
+
+    report.tot_tof = sim.stats.toffoli_gates;
+    report.tot_cliff = sim.stats.clifford_gates;
+    report
+}
+
 fn run_tests(
     ops: &[Op],
     layout_regs: &[Vec<QubitOrBit>],
     total_qubits: u64,
     num_bits: u64,
     mut xof: sha3::Shake256Reader,
+    sample_seed: &str,
+    ops_hash: &[u8; 32],
     target_shots: usize,
 ) -> SeedReport {
     let curve = secp256k1();
@@ -298,8 +463,48 @@ fn run_tests(
     }
     let n = targets.len();
 
-    let mut sim = Simulator::new(total_qubits as usize, num_bits as usize, &mut xof);
-    let mut ancilla_ok = true;
+    const BATCH: usize = 64;
+    let num_batches = (n + BATCH - 1) / BATCH;
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(num_batches.max(1));
+
+    let targets_ref = &targets;
+    let offsets_ref = &offsets;
+    let expected_ref = &expected;
+    let mut reports = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for worker in 0..num_workers {
+            let batch_start = worker * num_batches / num_workers;
+            let batch_end = (worker + 1) * num_batches / num_workers;
+            if batch_start == batch_end {
+                continue;
+            }
+
+            handles.push(scope.spawn(move || {
+                run_batch_range(
+                    ops,
+                    layout_regs,
+                    total_qubits,
+                    num_bits,
+                    targets_ref,
+                    offsets_ref,
+                    expected_ref,
+                    sample_seed,
+                    ops_hash,
+                    batch_start,
+                    batch_end,
+                )
+            }));
+        }
+
+        for handle in handles {
+            reports.push(handle.join().expect("batch worker panicked"));
+        }
+    });
+
     let mut fail_reason: Option<String> = None;
     let mut first_classical_mismatch: Option<String> = None;
     let mut first_phase_garbage: Option<String> = None;
@@ -308,82 +513,25 @@ fn run_tests(
     let mut phase_failures = 0usize;
     let mut phase_garbage_batches = 0usize;
     let mut ancilla_garbage_batches = 0usize;
+    let mut tot_tof = 0u64;
+    let mut tot_cliff = 0u64;
 
-    const BATCH: usize = 64;
-    let num_batches = (n + BATCH - 1) / BATCH;
-    for batch in 0..num_batches {
-        let bs = BATCH.min(n - batch * BATCH);
-        let cond_mask: u64 = if bs == 64 { u64::MAX } else { (1u64 << bs) - 1 };
-
-        sim.clear_for_shot();
-        for shot in 0..bs {
-            let i = batch * BATCH + shot;
-            sim.set_register(&layout_regs[0], targets[i].0, shot);
-            sim.set_register(&layout_regs[1], targets[i].1, shot);
-            sim.set_register(&layout_regs[2], offsets[i].0, shot);
-            sim.set_register(&layout_regs[3], offsets[i].1, shot);
+    for report in reports {
+        tot_tof += report.tot_tof;
+        tot_cliff += report.tot_cliff;
+        sampled_failures += report.sampled_failures;
+        classical_failures += report.classical_failures;
+        phase_failures += report.phase_failures;
+        phase_garbage_batches += report.phase_garbage_batches;
+        ancilla_garbage_batches += report.ancilla_garbage_batches;
+        if fail_reason.is_none() {
+            fail_reason = report.fail_reason;
         }
-
-        sim.apply_iter(ops.iter());
-
-        let mut sampled_failure_mask = 0u64;
-        for shot in 0..bs {
-            let i = batch * BATCH + shot;
-            let gx = sim.get_register(&layout_regs[0], shot);
-            let gy = sim.get_register(&layout_regs[1], shot);
-            if gx != expected[i].0 || gy != expected[i].1 {
-                classical_failures += 1;
-                sampled_failure_mask |= 1u64 << shot;
-                if first_classical_mismatch.is_none() {
-                    first_classical_mismatch = Some(format!(
-                        "CLASSICAL MISMATCH shot {i}: got ({:#x},{:#x}) exp ({:#x},{:#x})",
-                        gx, gy, expected[i].0, expected[i].1
-                    ));
-                }
-            }
+        if first_classical_mismatch.is_none() {
+            first_classical_mismatch = report.first_classical_mismatch;
         }
-
-        let phase = sim.phase & cond_mask;
-        if phase != 0 {
-            phase_garbage_batches += 1;
-            phase_failures += phase.count_ones() as usize;
-            sampled_failure_mask |= phase;
-            if first_phase_garbage.is_none() {
-                first_phase_garbage = Some(format!(
-                    "PHASE GARBAGE batch {batch}: global_phase = {:#018x} across {} live shots",
-                    phase, bs
-                ));
-            }
-        }
-        sampled_failures += sampled_failure_mask.count_ones() as usize;
-
-        for register in layout_regs {
-            for qb in register {
-                if let QubitOrBit::Qubit(q) = *qb {
-                    *sim.qubit_mut(q) = 0;
-                }
-            }
-        }
-        let mut garbage_q: Option<u64> = None;
-        for q in 0..total_qubits {
-            let v = sim.qubit(QubitId(q)) & cond_mask;
-            if v != 0 {
-                garbage_q = Some(q);
-                break;
-            }
-        }
-        if let Some(q) = garbage_q {
-            ancilla_garbage_batches += 1;
-            let v = sim.qubit(QubitId(q)) & cond_mask;
-            let msg = format!(
-                "ANCILLA GARBAGE: qubit {} = {:#018x} (live shots) at end of forward; \
-                 every non-register qubit must be |0⟩ on every live shot",
-                q, v
-            );
-            if fail_reason.is_none() {
-                fail_reason = Some(msg);
-            }
-            ancilla_ok = false;
+        if first_phase_garbage.is_none() {
+            first_phase_garbage = report.first_phase_garbage;
         }
     }
 
@@ -403,11 +551,11 @@ fn run_tests(
         ));
     }
     SeedReport {
-        ok: ancilla_ok && sampled_ok,
-        avg_cliff: sim.stats.clifford_gates as f64 / denom,
-        avg_tof: sim.stats.toffoli_gates as f64 / denom,
-        tot_tof: sim.stats.toffoli_gates,
-        tot_cliff: sim.stats.clifford_gates,
+        ok: ancilla_garbage_batches == 0 && sampled_ok,
+        avg_cliff: tot_cliff as f64 / denom,
+        avg_tof: tot_tof as f64 / denom,
+        tot_tof,
+        tot_cliff,
         n_shots: n,
         max_sampled_failures: MAX_SAMPLED_FAILURES,
         sampled_failures,
@@ -456,6 +604,16 @@ fn parse_args() -> Result<EvalArgs, String> {
         note: note.replace('\t', " ").replace('\n', " "),
         sample_seed,
     })
+}
+
+fn target_num_tests() -> Result<usize, String> {
+    match std::env::var("QECC_EVAL_NUM_TESTS") {
+        Ok(v) => v
+            .parse::<usize>()
+            .map_err(|e| format!("QECC_EVAL_NUM_TESTS={v:?} is not a valid usize: {e}")),
+        Err(std::env::VarError::NotPresent) => Ok(NUM_TESTS),
+        Err(e) => Err(format!("could not read QECC_EVAL_NUM_TESTS: {e}")),
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -513,6 +671,10 @@ fn append_results_row(
     ops_len: usize,
     note: &str,
 ) {
+    if std::env::var_os("QECC_EVAL_SUPPRESS_RESULTS").is_some() {
+        return;
+    }
+
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -542,6 +704,10 @@ fn note_with_sample_seed(note: &str, sample_seed: &str) -> String {
 }
 
 fn write_score(avg_tof: f64, qubits: u64) {
+    if std::env::var_os("QECC_EVAL_SUPPRESS_RESULTS").is_some() {
+        return;
+    }
+
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/score.json");
     let toffoli = avg_tof.round() as u64;
     let score = toffoli.saturating_mul(qubits);
@@ -573,6 +739,13 @@ fn main() {
         }
     };
     let note = args.note;
+    let target_shots = match target_num_tests() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("!! {e}");
+            std::process::exit(2);
+        }
+    };
     println!("=== quantum_ecc: eval_circuit (trusted stage) ===\n");
 
     let ops = match load_ops(OPS_PATH) {
@@ -647,13 +820,22 @@ fn main() {
     println!("  bits        : {}", num_bits);
     println!("  sample seed : {} ({})", sample_seed, sample_seed_source);
 
-    println!("\n-- correctness tests ({} shots) --", NUM_TESTS);
+    println!("\n-- correctness tests ({} shots) --", target_shots);
     println!(
         "  sampled pass bound     : <= {} classical/phase failures",
         MAX_SAMPLED_FAILURES
     );
     let xof = trusted_random_xof(&sample_seed, &ops_hash);
-    let r = run_tests(&ops, &regs, total_qubits, num_bits, xof, NUM_TESTS);
+    let r = run_tests(
+        &ops,
+        &regs,
+        total_qubits,
+        num_bits,
+        xof,
+        &sample_seed,
+        &ops_hash,
+        target_shots,
+    );
     println!("  tested shots            : {}", r.n_shots);
     println!("  sampled failures        : {}", r.sampled_failures);
     println!("  classical mismatches    : {}", r.classical_failures);
