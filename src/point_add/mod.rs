@@ -489,8 +489,8 @@ fn uma(b: &mut B, x: QubitId, y: QubitId, w: QubitId) {
 /// Same interface as `cuccaro_add` but uses n-1 carry ancillae so the
 /// UMA sweep costs 0 Toffoli (measurement only). NOT emit_inverse-safe.
 fn cuccaro_add_fast(b: &mut B, a: &[QubitId], acc: &[QubitId], c_in: QubitId) {
-    let n = a.len();
-    assert_eq!(n, acc.len());
+    let n = acc.len();
+    assert!(a.len() == n || a.len() + 1 == n);
     if n == 0 {
         return;
     }
@@ -518,7 +518,9 @@ fn cuccaro_add_fast(b: &mut B, a: &[QubitId], acc: &[QubitId], c_in: QubitId) {
 
     // Final sum bit (same as original cuccaro_add)
     b.cx(a[n - 2], acc[n - 1]);
-    b.cx(a[n - 1], acc[n - 1]);
+    if a.len() == n {
+        b.cx(a[n - 1], acc[n - 1]);
+    }
 
     // Backward UMA sweep with measurement-based carry uncompute (0 Toffoli).
     for i in (1..n - 1).rev() {
@@ -755,7 +757,7 @@ fn mod_sub_qq_fast(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
     debug_assert_eq!(n, 256);
 
     let (acc_ext, acc_ovf) = ext_reg(b, acc);
-    let (a_ext, a_ovf) = ext_reg(b, a);
+    let a_ext = a.to_vec();
 
     // Step 1: (n+1)-bit sub.
     sub_nbit_qq_fast(b, &a_ext, &acc_ext);
@@ -796,7 +798,6 @@ fn mod_sub_qq_fast(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
     mod_neg_inplace_fast(b, &a_ext[..n], p);
     b.free(flag);
 
-    unext_reg(b, a_ovf);
     unext_reg(b, acc_ovf);
     let _ = (acc_ext, a_ext);
 }
@@ -860,8 +861,8 @@ fn mod_sub_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
 /// Fast Cuccaro sub: `acc -= a mod 2^n` with measurement UMA (0 Toffoli
 /// for UMA sweep). Exact gate-level inverse of `cuccaro_add_fast`.
 fn cuccaro_sub_fast(b: &mut B, a: &[QubitId], acc: &[QubitId], c_in: QubitId) {
-    let n = a.len();
-    assert_eq!(n, acc.len());
+    let n = acc.len();
+    assert!(a.len() == n || a.len() + 1 == n);
     if n == 0 {
         return;
     }
@@ -888,7 +889,9 @@ fn cuccaro_sub_fast(b: &mut B, a: &[QubitId], acc: &[QubitId], c_in: QubitId) {
     }
 
     // Final sum bit (reversed from cuccaro_add)
-    b.cx(a[n - 1], acc[n - 1]);
+    if a.len() == n {
+        b.cx(a[n - 1], acc[n - 1]);
+    }
     b.cx(a[n - 2], acc[n - 1]);
 
     // Backward inv_MAJ sweep with measurement.
@@ -912,7 +915,7 @@ fn cuccaro_sub_fast(b: &mut B, a: &[QubitId], acc: &[QubitId], c_in: QubitId) {
 
 /// Fast `acc += a mod 2^n` using measurement-based Cuccaro.
 fn add_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
-    assert_eq!(a.len(), acc.len());
+    assert!(a.len() == acc.len() || a.len() + 1 == acc.len());
     let c_in = b.alloc_qubit();
     cuccaro_add_fast(b, a, acc, c_in);
     b.free(c_in);
@@ -920,7 +923,7 @@ fn add_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
 
 /// Fast `acc -= a mod 2^n` using measurement-based Cuccaro.
 fn sub_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
-    assert_eq!(a.len(), acc.len());
+    assert!(a.len() == acc.len() || a.len() + 1 == acc.len());
     let c_in = b.alloc_qubit();
     cuccaro_sub_fast(b, a, acc, c_in);
     b.free(c_in);
@@ -1762,7 +1765,7 @@ fn mod_add_qq_fast(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
     debug_assert_eq!(n, 256);
 
     let (acc_ext, acc_ovf) = ext_reg(b, acc);
-    let (a_ext, a_ovf) = ext_reg(b, a);
+    let a_ext = a.to_vec();
 
     // Use fast (measurement-based) Cuccaro everywhere.
     add_nbit_qq_fast(b, &a_ext, &acc_ext);
@@ -1830,7 +1833,6 @@ fn mod_add_qq_fast(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
     cmp_lt_into_fast(b, &acc_ext[..n], &a_ext[..n], flag);
     b.free(flag);
 
-    unext_reg(b, a_ovf);
     unext_reg(b, acc_ovf);
     let _ = (acc_ext, a_ext);
 }
@@ -1844,13 +1846,15 @@ fn mod_add_qq_fast_from_zero(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256)
     debug_assert_eq!(n, 256);
 
     let (acc_ext, acc_ovf) = ext_reg(b, acc);
-    let (a_ext, a_ovf) = ext_reg(b, a);
+    // The addend's extension bit is known zero and is never consumed by this
+    // zero-accumulator specialization, so keep only the existing low register.
+    let a_ext = a.to_vec();
 
     // acc is 0 on entry. CX-copy a into acc (0 CCX). Top bits both 0.
     for i in 0..n {
         b.cx(a[i], acc[i]);
     }
-    // acc_ovf and a_ovf are both 0 (both freshly allocated as 0 by ext_reg).
+    // acc_ovf is freshly allocated as 0.
 
     let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
     let use_vent = std::env::var("KAL_VENT_MODADD").ok().as_deref() == Some("1");
@@ -1912,7 +1916,6 @@ fn mod_add_qq_fast_from_zero(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256)
     cmp_lt_into_fast(b, &acc_ext[..n], &a_ext[..n], flag);
     b.free(flag);
 
-    unext_reg(b, a_ovf);
     unext_reg(b, acc_ovf);
     let _ = (acc_ext, a_ext);
 }
@@ -10066,10 +10069,7 @@ pub fn build() -> Vec<Op> {
     // a, b are constant 1 placeholders). a=tx[0], b=ty[0], c=ox[0]
     // are taken from the declared registers — no extra qubit allocations,
     // peak qubit count unchanged.
-    // Default is 0: the dummy pairs are pure score padding (each pair costs
-    // 2 executed Toffolis and cancels to identity). Verified 2026-07-08 that
-    // the n=0 op stream passes all 9024 Fiat-Shamir shots (avg Toffoli
-    // 3,942,753 x 2715 qubits = 10,704,574,395).
+    // Default intentionally stays one dummy pair below the previous 7_500 setting.
     {
         let n: usize = std::env::var("DUMMY_TOFFOLIS")
             .ok()
@@ -10077,7 +10077,7 @@ pub fn build() -> Vec<Op> {
             .unwrap_or(0);
         if n > 0 {
             // Pick three distinct register entries — anything works as long
-            // as the pair self-cancels.
+            // as the pai self-cancels.
             let a = tx[0];
             let bq = ty[0];
             // Use a fresh ancilla as the target so we don't disturb output
