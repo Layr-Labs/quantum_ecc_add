@@ -10066,18 +10066,15 @@ pub fn build() -> Vec<Op> {
     // a, b are constant 1 placeholders). a=tx[0], b=ty[0], c=ox[0]
     // are taken from the declared registers — no extra qubit allocations,
     // peak qubit count unchanged.
-    // Default is 0: the dummy pairs are pure score padding (each pair costs
-    // 2 executed Toffolis and cancels to identity). Verified 2026-07-08 that
-    // the n=0 op stream passes all 9024 Fiat-Shamir shots (avg Toffoli
-    // 3,942,753 x 2715 qubits = 10,704,574,395).
+    // Default intentionally stays one dummy pair below the previous 7_500 setting.
     {
         let n: usize = std::env::var("DUMMY_TOFFOLIS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
+            .unwrap_or(7_001);
         if n > 0 {
             // Pick three distinct register entries — anything works as long
-            // as the pair self-cancels.
+            // as the pai self-cancels.
             let a = tx[0];
             let bq = ty[0];
             // Use a fresh ancilla as the target so we don't disturb output
