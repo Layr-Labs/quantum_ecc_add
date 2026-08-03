@@ -1073,6 +1073,7 @@ name = "quantum_ecc"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "rand 0.9.4",
  "ruint",
  "sha3",
  "zstd",
