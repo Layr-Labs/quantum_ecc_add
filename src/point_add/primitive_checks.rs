@@ -576,12 +576,17 @@ fn wide_short_addend_roundtrip() {
 #[test]
 fn clean_modular_scaling() {
     let p=SECP256K1_P;let mut seed=Shake256::default();seed.update(b"clean modular scaling independent vectors");let mut input=seed.finalize_xof();
-    for steps in [1usize,4,22,64,408] {
+    for steps in [1usize,4,22,64,96,128,408] {
         let factor=pow_mod_2_k(p,steps);let reciprocal=classical_modinv(factor,p);
         for inverse in [false,true] {
             let mut b=B::new();let value=b.alloc_qubits(256);
-            clean_scale::many(&mut b,&value,p,steps,inverse);
-            let boundary=b.ops.len();clean_scale::many(&mut b,&value,p,steps,!inverse);
+            if steps<=128 {
+                if inverse {clean_scale::right(&mut b,&value,p,steps);}else{clean_scale::left(&mut b,&value,p,steps);}
+            }else{clean_scale::many(&mut b,&value,p,steps,inverse);}
+            let boundary=b.ops.len();
+            if steps<=128 {
+                if inverse {clean_scale::left(&mut b,&value,p,steps);}else{clean_scale::right(&mut b,&value,p,steps);}
+            }else{clean_scale::many(&mut b,&value,p,steps,!inverse);}
             let vr:Vec<_>=value.iter().copied().map(QubitOrBit::Qubit).collect();
             let mut xof=Shake256::default().finalize_xof();let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
             for _ in 0..8 {
@@ -598,6 +603,42 @@ fn clean_modular_scaling() {
                 for lane in 0..64 {assert_eq!(sim.get_register(&vr,lane),before[lane]);}
                 for q in 0..b.next_qubit {if !value.contains(&QubitId(q)) {assert_eq!(sim.qubits[q as usize],0);}}
             }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn scaling_construction_costs() {
+    for block in [16usize,24,32,40,48,56,64,72,80,88,96,112,128] {
+        for inverse in [false,true] {
+            let mut b=B::new();let _context=b.alloc_qubits(1177);let value=b.alloc_qubits(256);b.declare_qubit_register(&value);
+            let mut remaining=408;
+            while remaining>0 {
+                let k=remaining.min(block);
+                if inverse {clean_scale::right(&mut b,&value,SECP256K1_P,k);}
+                else {clean_scale::left(&mut b,&value,SECP256K1_P,k);}
+                remaining-=k;
+            }
+            let mut ops=std::mem::take(&mut b.ops);fold_basis_constants(&mut ops,b.next_qubit as usize);
+            let toff=ops.iter().filter(|o|matches!(o.kind,OperationType::CCX|OperationType::CCZ)).count();
+            assert!(ops.iter().filter(|o|matches!(o.kind,OperationType::CCX|OperationType::CCZ)).all(|o|o.c_condition==crate::circuit::NO_BIT));
+            eprintln!("SCALE_COST block={block} inverse={inverse} toff={toff} peak={} ops={}",b.peak_qubits,ops.len());
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn scaling_single_block_costs() {
+    for block in 1usize..=128 {
+        for inverse in [false,true] {
+            let mut b=B::new();let _context=b.alloc_qubits(1177);let value=b.alloc_qubits(256);b.declare_qubit_register(&value);
+            if inverse {clean_scale::right(&mut b,&value,SECP256K1_P,block);}else{clean_scale::left(&mut b,&value,SECP256K1_P,block);}
+            let mut ops=std::mem::take(&mut b.ops);fold_basis_constants(&mut ops,b.next_qubit as usize);
+            let toff=ops.iter().filter(|o|matches!(o.kind,OperationType::CCX|OperationType::CCZ)).count();
+            assert!(ops.iter().filter(|o|matches!(o.kind,OperationType::CCX|OperationType::CCZ)).all(|o|o.c_condition==crate::circuit::NO_BIT));
+            eprintln!("SINGLE_SCALE_COST block={block} inverse={inverse} toff={toff} peak={}",b.peak_qubits);
         }
     }
 }

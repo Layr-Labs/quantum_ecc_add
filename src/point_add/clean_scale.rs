@@ -1,6 +1,8 @@
 //! Clean in-place powers of two modulo the secp256k1 prime.
 use super::*;
 
+pub(super) const BLOCK_SIZE: usize = 68;
+
 fn inverse_low_bits(c: U256, k: usize) -> U256 {
     let mut inverse=U256::from(1u64);
     for _ in 0..8 {
@@ -49,7 +51,7 @@ fn below_product_into(b: &mut B, value: &[QubitId], product: &[QubitId], target:
 }
 
 pub(super) fn left(b: &mut B, value: &[QubitId], p: U256, k: usize) {
-    assert_eq!(p,SECP256K1_P);assert_eq!(value.len(),256);assert!(k>0&&k<=64);
+    assert_eq!(p,SECP256K1_P);assert_eq!(value.len(),256);assert!(k>0&&k<=128);
     let c=U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1u64));
     let inverse=inverse_low_bits(c,k);
     let (q,flag,overflow)=mod_shift_left_by_k(b,value,p,k);
@@ -65,7 +67,7 @@ pub(super) fn left(b: &mut B, value: &[QubitId], p: U256, k: usize) {
 }
 
 pub(super) fn right(b: &mut B, value: &[QubitId], p: U256, k: usize) {
-    assert_eq!(p,SECP256K1_P);assert_eq!(value.len(),256);assert!(k>0&&k<=64);
+    assert_eq!(p,SECP256K1_P);assert_eq!(value.len(),256);assert!(k>0&&k<=128);
     let c=U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1u64));
     let inverse=inverse_low_bits(c,k);
     let q=b.alloc_qubits(k);inverse_product(b,value,&q,inverse,false);
@@ -82,7 +84,7 @@ pub(super) fn right(b: &mut B, value: &[QubitId], p: U256, k: usize) {
 pub(super) fn many(b: &mut B, value: &[QubitId], p: U256, steps: usize, inverse: bool) {
     let mut remaining=steps;
     while remaining>0 {
-        let k=remaining.min(64);
+        let k=remaining.min(BLOCK_SIZE);
         if inverse {right(b,value,p,k);}else{left(b,value,p,k);}
         remaining-=k;
     }
