@@ -1710,7 +1710,6 @@ fn cmp_lt_into_fast(b: &mut B, u: &[QubitId], v: &[QubitId], flag: QubitId) {
     }
     let n = u.len();
     assert_eq!(n, v.len());
-    let c_in = b.alloc_qubit();
     let carries = b.alloc_qubits(n);
     for i in 0..n {
         b.x(u[i]);
@@ -1718,8 +1717,7 @@ fn cmp_lt_into_fast(b: &mut B, u: &[QubitId], v: &[QubitId], flag: QubitId) {
 
     // Forward MAJ sweep with carry ancillae
     b.cx(u[0], v[0]);
-    b.cx(u[0], c_in);
-    b.ccx(c_in, v[0], carries[0]);
+    b.ccx(u[0], v[0], carries[0]);
     b.cx(carries[0], u[0]);
     for i in 1..n {
         b.cx(u[i], v[i]);
@@ -1742,15 +1740,13 @@ fn cmp_lt_into_fast(b: &mut B, u: &[QubitId], v: &[QubitId], flag: QubitId) {
     b.cx(carries[0], u[0]);
     let m0 = b.alloc_bit();
     b.hmr(carries[0], m0);
-    b.cz_if(c_in, v[0], m0);
-    b.cx(u[0], c_in);
+    b.cz_if(u[0], v[0], m0);
     b.cx(u[0], v[0]);
 
     for i in 0..n {
         b.x(u[i]);
     }
     b.free_vec(&carries);
-    b.free(c_in);
 }
 
 /// Like `mod_add_qq` but uses `cmp_lt_into_fast` for the flag uncompute.
@@ -1792,32 +1788,12 @@ fn mod_add_qq_fast(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
         b.x(one);
         b.free(one);
     }
-    let flag = b.alloc_qubit();
-    b.cx(acc_ovf, flag);
-    b.x(flag);
-    // csub_nbit_const with fast Cuccaro OR venting.
-    if use_vent {
-        let c_low = c.as_limbs()[0];
-        let n1 = acc_ext.len();
-        let q_clean2: [QubitId; 2] = [b.alloc_qubit(), b.alloc_qubit()];
-        venting::cisub_dirty_2clean_classical(
-            b,
-            &acc_ext,
-            &a_ext[..n1 - 2],
-            &q_clean2,
-            c_low,
-            flag,
-        );
-        b.free(q_clean2[0]);
-        b.free(q_clean2[1]);
-    } else {
-        let n1 = acc_ext.len();
-        csub_nbit_const_direct_fast(b, &acc_ext[..n1], c, flag);
-    }
-    b.x(flag);
-    b.cx(flag, acc_ovf);
-    cmp_lt_into_fast(b, &acc_ext[..n], &a_ext[..n], flag);
-    b.free(flag);
+    // The extension bit itself records reduction. The correction is
+    // performed on the low register, so it can also serve as control.
+    b.x(acc_ovf);
+    csub_nbit_const_direct_fast(b, &acc_ext[..n], c, acc_ovf);
+    b.x(acc_ovf);
+    cmp_lt_into_fast(b, &acc_ext[..n], &a_ext[..n], acc_ovf);
 
     unext_reg(b, acc_ovf);
     let _ = (acc_ext, a_ext);
@@ -1866,31 +1842,12 @@ fn mod_add_qq_fast_from_zero(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256)
         b.x(one);
         b.free(one);
     }
-    let flag = b.alloc_qubit();
-    b.cx(acc_ovf, flag);
-    b.x(flag);
-    if use_vent {
-        let c_low = c.as_limbs()[0];
-        let n1 = acc_ext.len();
-        let q_clean2: [QubitId; 2] = [b.alloc_qubit(), b.alloc_qubit()];
-        venting::cisub_dirty_2clean_classical(
-            b,
-            &acc_ext,
-            &a_ext[..n1 - 2],
-            &q_clean2,
-            c_low,
-            flag,
-        );
-        b.free(q_clean2[0]);
-        b.free(q_clean2[1]);
-    } else {
-        let n1 = acc_ext.len();
-        csub_nbit_const_direct_fast(b, &acc_ext[..n1], c, flag);
-    }
-    b.x(flag);
-    b.cx(flag, acc_ovf);
-    cmp_lt_into_fast(b, &acc_ext[..n], &a_ext[..n], flag);
-    b.free(flag);
+    // The extension bit itself records reduction. The correction is
+    // performed on the low register, so it can also serve as control.
+    b.x(acc_ovf);
+    csub_nbit_const_direct_fast(b, &acc_ext[..n], c, acc_ovf);
+    b.x(acc_ovf);
+    cmp_lt_into_fast(b, &acc_ext[..n], &a_ext[..n], acc_ovf);
 
     unext_reg(b, acc_ovf);
     let _ = (acc_ext, a_ext);
