@@ -388,7 +388,7 @@ pub const N: usize = 256;
 
 // Choose lower-workspace arithmetic only where a fast temporary would exceed
 // this geometry budget. This does not depend on arithmetic input values.
-const WORKSPACE_SOFT_LIMIT: usize = 2350;
+const WORKSPACE_SOFT_LIMIT: usize = 2335;
 
 /// secp256k1 prime:  p = 2^256 - 2^32 - 977.
 pub const SECP256K1_P: U256 = U256::from_limbs([
