@@ -511,3 +511,64 @@ fn classical_offset_multiples() {
         }
     }
 }
+
+#[test]
+fn exhaustive_constant_one_carry() {
+    for n in 1..=6 {
+        for short in [false,true] {
+            if short && n==1 {continue;}
+            for subtract in [false,true] {
+                let mut b=B::new();let a=b.alloc_qubits(n-usize::from(short));let acc=b.alloc_qubits(n);
+                if subtract {cuccaro_sub_fast_one(&mut b,&a,&acc);}else{cuccaro_add_fast_one(&mut b,&a,&acc);}
+                let ar:Vec<_>=a.iter().copied().map(QubitOrBit::Qubit).collect();let rr:Vec<_>=acc.iter().copied().map(QubitOrBit::Qubit).collect();
+                let mut xof=Shake256::default().finalize_xof();let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+                let cases=1usize<<(a.len()+n);
+                for first in (0..cases).step_by(64) {
+                    sim.clear_for_shot();let lanes=64.min(cases-first);
+                    for lane in 0..lanes {let case=first+lane;sim.set_register(&ar,U256::from(case>>n),lane);sim.set_register(&rr,U256::from(case&((1<<n)-1)),lane);}
+                    apply_clean(&mut sim,&b.ops);assert_eq!(sim.phase,0);
+                    for lane in 0..lanes {let case=first+lane;let av=(case>>n) as u64;let rv=(case&((1<<n)-1)) as u64;let expected=if subtract {rv.wrapping_sub(av+1)}else{rv+av+1}&((1<<n)-1);assert_eq!(sim.get_register(&rr,lane),U256::from(expected));assert_eq!(sim.get_register(&ar,lane),U256::from(av));}
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exhaustive_biased_controlled_kernel() {
+    for n in 1..=5 {
+        let mut b=B::new();let ctrl=b.alloc_qubit();let x=b.alloc_qubits(n);let acc=b.alloc_qubits(n+1);
+        controlled_add_subtract_fast(&mut b,&x,&acc,ctrl);let boundary=b.ops.len();controlled_add_subtract_fast_inverse(&mut b,&x,&acc,ctrl);
+        let xr:Vec<_>=x.iter().copied().map(QubitOrBit::Qubit).collect();let rr:Vec<_>=acc.iter().copied().map(QubitOrBit::Qubit).collect();
+        let mut xof=Shake256::default().finalize_xof();let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+        let cases=1usize<<(2*n+2);let mask=(1u64<<(n+1))-1;
+        for first in (0..cases).step_by(64) {
+            sim.clear_for_shot();let lanes=64.min(cases-first);
+            for lane in 0..lanes {let case=first+lane;sim.qubits[ctrl.0 as usize]|=((case&1) as u64)<<lane;sim.set_register(&xr,U256::from((case>>1)&((1<<n)-1)),lane);sim.set_register(&rr,U256::from((case>>(n+1))&mask as usize),lane);}
+            apply_clean(&mut sim,&b.ops[..boundary]);assert_eq!(sim.phase,0);
+            for lane in 0..lanes {let case=first+lane;let xv=((case>>1)&((1<<n)-1)) as u64;let rv=((case>>(n+1))&mask as usize) as u64;let delta=if case&1==1 {xv}else{(1u64<<n)-xv};assert_eq!(sim.get_register(&rr,lane),U256::from((rv+delta)&mask));assert_eq!(sim.get_register(&xr,lane),U256::from(xv));assert_eq!((sim.qubit(ctrl)>>lane)&1,(case&1) as u64);}
+            apply_clean(&mut sim,&b.ops[boundary..]);assert_eq!(sim.phase,0);
+            for lane in 0..lanes {let case=first+lane;assert_eq!(sim.get_register(&rr,lane),U256::from((case>>(n+1))&mask as usize));assert_eq!(sim.get_register(&xr,lane),U256::from((case>>1)&((1<<n)-1)));assert_eq!((sim.qubit(ctrl)>>lane)&1,(case&1) as u64);}
+        }
+    }
+}
+
+#[test]
+fn wide_short_addend_roundtrip() {
+    let mut b=B::new();let a=b.alloc_qubits(256);let acc=b.alloc_qubits(513);
+    add_zero_extended(&mut b,&a,&acc);let boundary=b.ops.len();sub_zero_extended(&mut b,&a,&acc);
+    let ar:Vec<_>=a.iter().copied().map(QubitOrBit::Qubit).collect();let rr:Vec<_>=acc.iter().copied().map(QubitOrBit::Qubit).collect();
+    let mut seed=Shake256::default();seed.update(b"wide short addend arithmetic");let mut input=seed.finalize_xof();let mut xof=Shake256::default().finalize_xof();let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+    for _ in 0..16 {
+        sim.clear_for_shot();
+        for &q in a.iter().chain(acc.iter()) {let mut bytes=[0u8;8];input.read(&mut bytes);sim.qubits[q.0 as usize]=u64::from_le_bytes(bytes);}
+        let before:Vec<_>=(0..64).map(|lane|(sim.get_register(&ar,lane),sim.get_register(&rr[..256],lane),sim.get_register(&rr[256..512],lane),(sim.qubit(acc[512])>>lane)&1)).collect();
+        apply_clean(&mut sim,&b.ops[..boundary]);assert_eq!(sim.phase,0);
+        for lane in 0..64 {
+            let (av,lo,hi,top)=before[lane];let newlo=lo.wrapping_add(av);let carry=newlo<lo;let newhi=hi.wrapping_add(U256::from(u64::from(carry)));let highcarry=carry&&newhi<hi;
+            assert_eq!(sim.get_register(&rr[..256],lane),newlo);assert_eq!(sim.get_register(&rr[256..512],lane),newhi);assert_eq!((sim.qubit(acc[512])>>lane)&1,top^u64::from(highcarry));assert_eq!(sim.get_register(&ar,lane),av);
+        }
+        apply_clean(&mut sim,&b.ops[boundary..]);assert_eq!(sim.phase,0);
+        for lane in 0..64 {let(av,lo,hi,top)=before[lane];assert_eq!(sim.get_register(&ar,lane),av);assert_eq!(sim.get_register(&rr[..256],lane),lo);assert_eq!(sim.get_register(&rr[256..512],lane),hi);assert_eq!((sim.qubit(acc[512])>>lane)&1,top);}
+    }
+}

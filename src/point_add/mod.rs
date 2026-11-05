@@ -900,6 +900,119 @@ fn cuccaro_sub_fast(b: &mut B, a: &[QubitId], acc: &[QubitId], c_in: QubitId) {
     b.free_vec(&carries);
 }
 
+/// Constant-one carry-in specialization.
+fn cuccaro_add_fast_one(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
+    let n = acc.len();
+    assert!(a.len() == n || a.len() + 1 == n);
+    if n == 0 {
+        return;
+    }
+    if n == 1 {
+        b.x(acc[0]);
+        b.cx(a[0], acc[0]);
+        return;
+    }
+
+    let carries = b.alloc_qubits(n - 1);
+
+    // Forward MAJ sweep with carry ancillae.
+    // Step 0: MAJ(c_in, acc[0], a[0]) → carry into carries[0]
+    b.cx(a[0], acc[0]);
+    b.x(a[0]);
+    b.ccx(a[0], acc[0], carries[0]);
+    b.x(a[0]);
+    b.cx(carries[0], a[0]);
+    // Steps 1..n-2: MAJ(a[i-1], acc[i], a[i]) → carry into carries[i]
+    for i in 1..n - 1 {
+        b.cx(a[i], acc[i]);
+        b.cx(a[i], a[i - 1]);
+        b.ccx(a[i - 1], acc[i], carries[i]);
+        b.cx(carries[i], a[i]);
+    }
+
+    // Final sum bit (same as original cuccaro_add)
+    b.cx(a[n - 2], acc[n - 1]);
+    if a.len() == n {
+        b.cx(a[n - 1], acc[n - 1]);
+    }
+
+    // Backward UMA sweep with measurement-based carry uncompute (0 Toffoli).
+    for i in (1..n - 1).rev() {
+        b.cx(carries[i], a[i]);
+        let m = b.alloc_bit();
+        b.hmr(carries[i], m);
+        b.cz_if(a[i - 1], acc[i], m);
+        b.cx(a[i], a[i - 1]);
+        b.cx(a[i - 1], acc[i]);
+    }
+    // Step 0 UMA:
+    b.cx(carries[0], a[0]);
+    let m0 = b.alloc_bit();
+    b.hmr(carries[0], m0);
+    b.x(a[0]);
+    b.cz_if(a[0], acc[0], m0);
+    b.x(a[0]);
+    b.x(acc[0]);
+
+    b.free_vec(&carries);
+}
+
+/// Constant-one carry-in specialization.
+fn cuccaro_sub_fast_one(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
+    let n = acc.len();
+    assert!(a.len() == n || a.len() + 1 == n);
+    if n == 0 {
+        return;
+    }
+    if n == 1 {
+        b.cx(a[0], acc[0]);
+        b.x(acc[0]);
+        return;
+    }
+
+    let carries = b.alloc_qubits(n - 1);
+
+    // Forward inv_UMA sweep with carry ancillae (reversed UMA from cuccaro_sub).
+    // Step 0:
+    b.x(acc[0]);
+    b.x(a[0]);
+    b.ccx(a[0], acc[0], carries[0]);
+    b.x(a[0]);
+    b.cx(carries[0], a[0]);
+    // Steps 1..n-2:
+    for i in 1..n - 1 {
+        b.cx(a[i - 1], acc[i]);
+        b.cx(a[i], a[i - 1]);
+        b.ccx(a[i - 1], acc[i], carries[i]);
+        b.cx(carries[i], a[i]);
+    }
+
+    // Final sum bit (reversed from cuccaro_add)
+    if a.len() == n {
+        b.cx(a[n - 1], acc[n - 1]);
+    }
+    b.cx(a[n - 2], acc[n - 1]);
+
+    // Backward inv_MAJ sweep with measurement.
+    for i in (1..n - 1).rev() {
+        b.cx(carries[i], a[i]);
+        let m = b.alloc_bit();
+        b.hmr(carries[i], m);
+        b.cz_if(a[i - 1], acc[i], m);
+        b.cx(a[i], a[i - 1]);
+        b.cx(a[i], acc[i]);
+    }
+    b.cx(carries[0], a[0]);
+    let m0 = b.alloc_bit();
+    b.hmr(carries[0], m0);
+    b.x(a[0]);
+    b.cz_if(a[0], acc[0], m0);
+    b.x(a[0]);
+    b.cx(a[0], acc[0]);
+
+    b.free_vec(&carries);
+}
+
 /// Zero-carry specialization; the first input supplies its carry copy.
 fn cuccaro_add_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     let n = acc.len();
@@ -1480,7 +1593,7 @@ fn add_zero_extended(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     assert!(a.len() <= n);
     if n == 0 { return; }
     let m = a.len();
-    if m > 0 && m < n && n-m <= 256 {
+    if m > 0 && m < n && n-m <= 257 {
         let overflow = b.alloc_qubit();
         let mut low = acc[..m].to_vec();
         low.push(overflow);
@@ -2342,39 +2455,19 @@ fn cmod_sub_qq(b: &mut B, acc: &[QubitId], a: &[QubitId], ctrl: QubitId, p: U256
 
 /// Controlled add-subtract on (n+1)-bit `acc` with n-bit `x` (padded with 0 at top).
 ///   ctrl=1 : acc += x  (mod 2^(n+1))
-///   ctrl=0 : acc -= x  (mod 2^(n+1))
+///   ctrl=0 : acc += 2^n-x (mod 2^(n+1)); the multiplier corrects this bias.
 /// Implementation: conditionally two's-complement (~x + 1) via flip-x plus c_in,
 /// then run a single unconditional Gidney/Cuccaro add. Cost = n-1 Toffoli (same as
 /// uncontrolled (n+1)-bit add without carry-out).
 fn controlled_add_subtract_fast(b: &mut B, x: &[QubitId], acc: &[QubitId], ctrl: QubitId) {
-    let n = x.len();
-    debug_assert_eq!(acc.len(), n + 1);
-
-    // x_ext: n+1 bits with top pad bit = 0. Only the low n bits of x_ext are flipped
-    // when ctrl=0 (two's-complement subtract via ~a + 1). The pad bit stays 0.
-    let pad = b.alloc_qubit();
-    let mut x_ext = x.to_vec();
-    x_ext.push(pad);
-
-    let c_in = b.alloc_qubit();
-
-    // If ctrl=0, we want x_ext[0..n] = ~x and c_in = 1. Encode via x(ctrl) + cx.
+    debug_assert_eq!(acc.len(), x.len()+1);
+    // The temporary complement makes ctrl the required carry-in itself.
+    // The adder restores that input before the complement is undone.
     b.x(ctrl);
-    for i in 0..n {
-        b.cx(ctrl, x_ext[i]);
-    }
-    b.cx(ctrl, c_in);
-
-    cuccaro_add_fast(b, &x_ext, acc, c_in);
-
-    b.cx(ctrl, c_in);
-    for i in 0..n {
-        b.cx(ctrl, x_ext[i]);
-    }
+    for &q in x { b.cx(ctrl,q); }
+    cuccaro_add_fast(b, x, acc, ctrl);
+    for &q in x { b.cx(ctrl,q); }
     b.x(ctrl);
-
-    b.free(c_in);
-    b.free(pad);
 }
 
 /// Low-peak variant of `controlled_add_subtract_fast` using non-fast
@@ -2442,31 +2535,14 @@ fn controlled_add_subtract_lowq_inverse(b: &mut B, x: &[QubitId], acc: &[QubitId
 ///   ctrl=1 : acc -= x
 ///   ctrl=0 : acc += x
 fn controlled_add_subtract_fast_inverse(b: &mut B, x: &[QubitId], acc: &[QubitId], ctrl: QubitId) {
-    let n = x.len();
-    debug_assert_eq!(acc.len(), n + 1);
-
-    let pad = b.alloc_qubit();
-    let mut x_ext = x.to_vec();
-    x_ext.push(pad);
-
-    let c_in = b.alloc_qubit();
-
+    debug_assert_eq!(acc.len(), x.len()+1);
+    // The temporary complement makes ctrl the required carry-in itself.
+    // The adder restores that input before the complement is undone.
     b.x(ctrl);
-    for i in 0..n {
-        b.cx(ctrl, x_ext[i]);
-    }
-    b.cx(ctrl, c_in);
-
-    cuccaro_sub_fast(b, &x_ext, acc, c_in);
-
-    b.cx(ctrl, c_in);
-    for i in 0..n {
-        b.cx(ctrl, x_ext[i]);
-    }
+    for &q in x { b.cx(ctrl,q); }
+    cuccaro_sub_fast(b, x, acc, ctrl);
+    for &q in x { b.cx(ctrl,q); }
     b.x(ctrl);
-
-    b.free(c_in);
-    b.free(pad);
 }
 
 /// Litinski 2024 add-subtract schoolbook: tmp_ext += x * y.
@@ -2506,58 +2582,21 @@ fn schoolbook_mul_into_addsub(b: &mut B, x: &[QubitId], y: &[QubitId], tmp_ext: 
     //     2xy + 2^{2n} - 2^n (x+y+1) + x
     //   Target: 2xy. So apply +2^n(y+1) + 2^n*x - 2^{2n} - x.
 
-    // +2^n * (y + 1): (n+1)-bit add of y_ext (top=0) into wide[n..2n+1] with c_in=1.
+    // +2^n*(y+1), with no physical top-zero or carry-one register.
     {
-        let pad = b.alloc_qubit();
-        let mut y_ext = y.to_vec();
-        y_ext.push(pad);
-        let slice: Vec<QubitId> = wide[n..2 * n + 1].to_vec();
-        let c_in = b.alloc_qubit();
-        b.x(c_in);
-        if std::env::var("KAL_VENT_MODADD").ok().as_deref() == Some("1") {
-            cuccaro_add(b, &y_ext, &slice, c_in);
-        } else {
-            cuccaro_add_fast(b, &y_ext, &slice, c_in);
-        }
-        b.x(c_in);
-        b.free(c_in);
-        b.free(pad);
+        let slice = &wide[n..2*n+1];
+        cuccaro_add_fast_one(b, y, slice);
     }
 
     // -2^{2n}: toggle wide[2n].
     b.x(wide[2 * n]);
 
-    // -x as full (2n+1)-bit sub. Use in-place cuccaro_sub (no carry ancillae) to
-    // keep peak qubits low during this otherwise-expensive full-width correction.
-    // Costs n-1 extra Toffoli vs cuccaro_sub_fast but saves 2n peak qubits.
-    {
-        let mut x_ext: Vec<QubitId> = x.to_vec();
-        while x_ext.len() < 2 * n + 1 {
-            x_ext.push(b.alloc_qubit());
-        }
-        let c_in = b.alloc_qubit();
-        cuccaro_sub(b, &x_ext, &wide, c_in);
-        b.free(c_in);
-        for _ in n..2 * n + 1 {
-            let q = x_ext.pop().unwrap();
-            b.free(q);
-        }
-    }
+    // -x across the wide accumulator without a zero-padding register.
+    sub_zero_extended(b, x, &wide);
 
-    // +2^n * x: (n+1)-bit add of x_ext into wide[n..2n+1].
     {
-        let pad = b.alloc_qubit();
-        let mut x_ext = x.to_vec();
-        x_ext.push(pad);
-        let slice: Vec<QubitId> = wide[n..2 * n + 1].to_vec();
-        let c_in = b.alloc_qubit();
-        if std::env::var("KAL_VENT_MODADD").ok().as_deref() == Some("1") {
-            cuccaro_add(b, &x_ext, &slice, c_in);
-        } else {
-            cuccaro_add_fast(b, &x_ext, &slice, c_in);
-        }
-        b.free(c_in);
-        b.free(pad);
+        let slice = &wide[n..2*n+1];
+        add_nbit_qq_fast(b, x, slice);
     }
 
     // wide = 2xy. /2 relabel: xy is at wide[1..2n+1] = tmp_ext. wide[0]=low should be 0.
@@ -2711,48 +2750,14 @@ fn schoolbook_mul_into_addsub_inverse(
     wide.push(low);
     wide.extend_from_slice(tmp_ext);
 
-    // Reverse correction 4: sub x at bit n.
-    {
-        let pad = b.alloc_qubit();
-        let mut x_ext = x.to_vec();
-        x_ext.push(pad);
-        let slice: Vec<QubitId> = wide[n..2 * n + 1].to_vec();
-        let c_in = b.alloc_qubit();
-        cuccaro_sub_fast(b, &x_ext, &slice, c_in);
-        b.free(c_in);
-        b.free(pad);
-    }
-    // Reverse correction 3 (sub x full-width): add x back with borrow propagation.
-    // Use in-place cuccaro_add (no carries) to keep peak low, matching forward.
-    {
-        let mut x_ext: Vec<QubitId> = x.to_vec();
-        while x_ext.len() < 2 * n + 1 {
-            x_ext.push(b.alloc_qubit());
-        }
-        let c_in = b.alloc_qubit();
-        cuccaro_add(b, &x_ext, &wide, c_in);
-        b.free(c_in);
-        for _ in n..2 * n + 1 {
-            let q = x_ext.pop().unwrap();
-            b.free(q);
-        }
-    }
+    // Reverse the two x corrections without padded addends.
+    sub_nbit_qq_fast(b, x, &wide[n..2*n+1]);
+    add_zero_extended(b, x, &wide);
     // Reverse correction 2: toggle wide[2n].
     b.x(wide[2 * n]);
-    // Reverse correction 1: sub (y+1) at bit n.
-    {
-        let pad = b.alloc_qubit();
-        let mut y_ext = y.to_vec();
-        y_ext.push(pad);
-        let slice: Vec<QubitId> = wide[n..2 * n + 1].to_vec();
-        let c_in = b.alloc_qubit();
-        b.x(c_in);
-        cuccaro_sub_fast(b, &y_ext, &slice, c_in);
-        b.x(c_in);
-        b.free(c_in);
-        b.free(pad);
-    }
-    // Reverse n add-subtract rows.
+    // Reverse the y+1 correction with a constant carry-in.
+    cuccaro_sub_fast_one(b, y, &wide[n..2*n+1]);
+
     for k in (0..n).rev() {
         let slice: Vec<QubitId> = wide[k..k + n + 1].to_vec();
         controlled_add_subtract_fast_inverse(b, x, &slice, y[k]);
