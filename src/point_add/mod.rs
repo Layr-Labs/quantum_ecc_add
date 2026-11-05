@@ -69,6 +69,7 @@ use crate::circuit::{analyze_ops, BitId, Op, OperationType, QubitId, QubitOrBit,
 use crate::sim::Simulator;
 use crate::weierstrass_elliptic_curve::WeierstrassEllipticCurve;
 
+mod classical_offset;
 mod fermat_inv;
 mod venting;
 
@@ -823,10 +824,7 @@ fn mod_add_qc(b: &mut B, acc: &[QubitId], c: U256, p: U256) {
 }
 
 fn mod_add_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
-    // acc := (acc + bits) mod p. `bits` is a classical bit register.
-    let a = load_bits(b, bits);
-    mod_add_qq_fast(b, acc, &a, p);
-    unload_bits(b, &a, bits);
+    classical_offset::field_add(b, acc, bits, p);
 }
 
 fn mod_add_double_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
@@ -849,10 +847,7 @@ fn mod_sub_double_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
 }
 
 fn mod_sub_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
-    // acc -= bits mod p. Uses fast mod_sub_qq via neg+add+neg.
-    let a = load_bits(b, bits);
-    mod_sub_qq_fast(b, acc, &a, p);
-    unload_bits(b, &a, bits);
+    classical_offset::field_sub(b, acc, bits, p);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

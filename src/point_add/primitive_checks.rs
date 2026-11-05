@@ -430,3 +430,57 @@ fn high_occupancy_field_arithmetic() {
         }
     }
 }
+
+#[test]
+fn exhaustive_classical_offset_primitives() {
+    for n in 1..=6 {
+        for mode in 0..3 {
+            let mut b=B::new();let a=b.alloc_bits(n);let acc=b.alloc_qubits(n);let flag=b.alloc_qubit();
+            match mode {0=>classical_offset::add_nbit(&mut b,&a,&acc),1=>classical_offset::sub_nbit(&mut b,&a,&acc),_=>classical_offset::lt_into(&mut b,&acc,&a,flag)}
+            let ar:Vec<_>=a.iter().copied().map(QubitOrBit::Bit).collect();
+            let rr:Vec<_>=acc.iter().copied().map(QubitOrBit::Qubit).collect();
+            let mut xof=Shake256::default().finalize_xof();let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+            let cases=1usize<<(2*n);
+            for first in (0..cases).step_by(64) {
+                sim.clear_for_shot();let lanes=64.min(cases-first);
+                for lane in 0..lanes {let case=first+lane;sim.set_register(&ar,U256::from(case>>n),lane);sim.set_register(&rr,U256::from(case&((1<<n)-1)),lane);}
+                apply_clean(&mut sim,&b.ops);assert_eq!(sim.phase,0);
+                for lane in 0..lanes {
+                    let case=first+lane;let av=(case>>n) as u64;let rv=(case&((1<<n)-1)) as u64;
+                    let expected=match mode {0=>rv+av,1=>rv.wrapping_sub(av),_=>rv}&((1<<n)-1);
+                    assert_eq!(sim.get_register(&rr,lane),U256::from(expected),"qb n={n} mode={mode} case={case}");
+                    assert_eq!(sim.get_register(&ar,lane),U256::from(av));
+                    if mode==2 {assert_eq!((sim.qubit(flag)>>lane)&1,u64::from(rv<av));}
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn classical_offset_field_arithmetic() {
+    let p=SECP256K1_P;let mut seed=Shake256::default();seed.update(b"classical offset field tests");let mut input=seed.finalize_xof();
+    for mode in 0..3 {
+        let mut b=B::new();let a=b.alloc_bits(256);let quantum=if mode<2 {b.alloc_qubits(256)}else{Vec::new()};let other=if mode==2 {b.alloc_bits(256)}else{Vec::new()};
+        let result=match mode {0=>{classical_offset::field_add(&mut b,&quantum,&a,p);Vec::new()},1=>{classical_offset::field_sub(&mut b,&quantum,&a,p);Vec::new()},_=>classical_offset::field_add_classical(&mut b,&a,&other,p)};
+        let ar:Vec<_>=a.iter().copied().map(QubitOrBit::Bit).collect();
+        let rr:Vec<_>=if mode<2 {quantum.iter().copied().map(QubitOrBit::Qubit).collect()}else{other.iter().copied().map(QubitOrBit::Bit).collect()};
+        let out:Vec<_>=if mode<2 {rr.clone()}else{result.iter().copied().map(QubitOrBit::Bit).collect()};
+        let mut xof=Shake256::default().finalize_xof();let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+        for _ in 0..16 {
+            sim.clear_for_shot();let mut before=Vec::new();
+            for lane in 0..64 {
+                let mut bytes=[0u8;32];input.read(&mut bytes);
+                let av=match lane {0=>U256::ZERO,1=>p-U256::from(1u64),2=>U256::from(1u64),_=>U256::from_le_bytes(bytes)%p};
+                input.read(&mut bytes);let rv=match lane {0=>U256::ZERO,1=>p-U256::from(1u64),2=>U256::ZERO,_=>U256::from_le_bytes(bytes)%p};
+                before.push((av,rv));sim.set_register(&ar,av,lane);sim.set_register(&rr,rv,lane);
+            }
+            apply_clean(&mut sim,&b.ops);assert_eq!(sim.phase,0);
+            for lane in 0..64 {
+                let (av,rv)=before[lane];let expected=if mode==1 {if rv>=av {rv-av}else{p-(av-rv)}}else{rv.add_mod(av,p)};
+                assert_eq!(sim.get_register(&out,lane),expected,"qb field mode={mode} lane={lane}");assert_eq!(sim.get_register(&ar,lane),av);
+                if mode==2 {assert_eq!(sim.get_register(&rr,lane),rv);}
+            }
+        }
+    }
+}
