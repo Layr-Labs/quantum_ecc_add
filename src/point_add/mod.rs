@@ -1238,20 +1238,7 @@ fn csub_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
 }
 
 fn cadd_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
-    let n = acc.len();
-    let a = b.alloc_qubits(n);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    add_nbit_qq_fast(b, &a, acc);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    b.free_vec(&a);
+    cadd_nbit_const_direct_fast(b, acc, c, ctrl);
 }
 
 /// Controlled add of a classical constant without a loaded addend register.
@@ -1328,6 +1315,49 @@ fn cadd_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
 }
 
 /// Uncontrolled constant addition without a constant-control ancilla.
+/// Add a shorter quantum addend without materializing zero padding.
+fn add_zero_extended(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
+    let n = acc.len();
+    assert!(a.len() <= n);
+    if n == 0 { return; }
+    let carry = b.alloc_qubits(n-1);
+    for i in 0..n-1 {
+        if i < a.len() {
+            if i == 0 { b.ccx(a[i], acc[i], carry[i]); }
+            else {
+                b.cx(a[i], acc[i]);
+                b.cx(a[i], carry[i-1]);
+                b.ccx(acc[i], carry[i-1], carry[i]);
+                b.cx(a[i], carry[i]);
+                b.cx(a[i], carry[i-1]);
+                b.cx(a[i], acc[i]);
+            }
+        } else if i > 0 { b.ccx(acc[i], carry[i-1], carry[i]); }
+    }
+    for i in 0..n {
+        if i < a.len() { b.cx(a[i], acc[i]); }
+        if i > 0 { b.cx(carry[i-1], acc[i]); }
+    }
+    for i in (0..n-1).rev() {
+        let m = b.alloc_bit();
+        b.hmr(carry[i], m);
+        b.x(acc[i]);
+        if i < a.len() {
+            b.cz_if(a[i], acc[i], m);
+            if i > 0 { b.cz_if(a[i], carry[i-1], m); }
+        }
+        if i > 0 { b.cz_if(acc[i], carry[i-1], m); }
+        b.x(acc[i]);
+    }
+    b.free_vec(&carry);
+}
+
+fn sub_zero_extended(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
+    for &q in acc { b.x(q); }
+    add_zero_extended(b, a, acc);
+    for &q in acc { b.x(q); }
+}
+
 fn add_nbit_const_direct(b: &mut B, acc: &[QubitId], c: U256) {
     let n = acc.len();
     if n == 0 { return; }
@@ -2695,13 +2725,9 @@ fn karatsuba_forward(
         b.free_vec(&pad);
     }
     {
-        let pad = b.alloc_qubits(3 * h - 2 * (h + 1));
-        let mut z1_ext: Vec<QubitId> = z1_reg.to_vec();
-        z1_ext.extend_from_slice(&pad);
-        let acc_slice: Vec<QubitId> = tmp_ext[h..4 * h].to_vec();
-        b.set_phase("kara_z1_add");
-        add_nbit_qq_fast(b, &z1_ext, &acc_slice);
-        b.free_vec(&pad);
+        let acc_slice: Vec<QubitId> = tmp_ext[h..4*h].to_vec();
+        b.set_phase("kara_zero_extended_merge");
+        add_zero_extended(b, z1_reg, &acc_slice);
     }
 }
 
@@ -2893,12 +2919,9 @@ fn karatsuba_inverse(
     let y_hi: Vec<QubitId> = y[h..n].to_vec();
 
     {
-        let pad = b.alloc_qubits(3 * h - 2 * (h + 1));
-        let mut z1_ext: Vec<QubitId> = z1_reg.to_vec();
-        z1_ext.extend_from_slice(&pad);
-        let acc_slice: Vec<QubitId> = tmp_ext[h..4 * h].to_vec();
-        sub_nbit_qq_fast(b, &z1_ext, &acc_slice);
-        b.free_vec(&pad);
+        let acc_slice: Vec<QubitId> = tmp_ext[h..4*h].to_vec();
+        b.set_phase("kara_zero_extended_merge");
+        sub_zero_extended(b, z1_reg, &acc_slice);
     }
     {
         let pad = b.alloc_qubits(2);
@@ -9375,6 +9398,7 @@ fn with_kal_inv_raw_coeff_caps<F: FnOnce(&mut B, &[QubitId])>(
     // available for clean branch-flag uncomputation.
     kaliski_forward_with_coeff_caps(b, v_in, &mut st, p, iters, coeff, bulk_caps);
 
+    eprintln!("KAL_END iters={} v0={:?} f={:?} u0={:?} ops={}", iters, st.v_w[0], st.f_flag, st.u[0], b.ops.len());
     if !keep_v {
         b.free_vec(&st.v_w);
     }

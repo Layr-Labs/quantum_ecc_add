@@ -117,3 +117,48 @@ fn large_direct_arithmetic_and_phase() {
         }
     }
 }
+
+#[test]
+fn exhaustive_controlled_constants() {
+    for n in 1..=5 {
+        for c in 0..1u64<<n {
+            for subtract in [false,true] {
+                let mut b=B::new();
+                let ctrl=b.alloc_qubit();
+                let acc=b.alloc_qubits(n);
+                if subtract { csub_nbit_const_direct_fast(&mut b,&acc,U256::from(c),ctrl); }
+                else { cadd_nbit_const_direct_fast(&mut b,&acc,U256::from(c),ctrl); }
+                let rr:Vec<_>=acc.iter().copied().map(QubitOrBit::Qubit).collect();
+                let mut xof=Shake256::default().finalize_xof();
+                let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+                sim.qubits[ctrl.0 as usize]=0xaaaaaaaaaaaaaaaa;
+                for lane in 0..64 { sim.set_register(&rr,U256::from((lane>>1)&((1usize<<n)-1)),lane); }
+                sim.apply_iter(b.ops.iter());
+                assert_eq!(sim.phase,0,"controlled phase n={n} c={c} subtract={subtract}");
+                assert_eq!(sim.qubit(ctrl),0xaaaaaaaaaaaaaaaa);
+                for lane in 0..64 {
+                    let rv=((lane>>1)&((1usize<<n)-1)) as u64;
+                    let addend=if lane&1==1 {c} else {0};
+                    let expected=if subtract {rv.wrapping_sub(addend)} else {rv+addend} & ((1u64<<n)-1);
+                    assert_eq!(sim.get_register(&rr,lane),U256::from(expected));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exhaustive_zero_extension() {
+    for n in 1..=6 {
+        for aw in 0..=n {
+            for subtract in [false,true] {
+                let mut b=B::new();
+                let a=b.alloc_qubits(aw);
+                let acc=b.alloc_qubits(n);
+                if subtract {sub_zero_extended(&mut b,&a,&acc);}
+                else {add_zero_extended(&mut b,&a,&acc);}
+                check_all(&b,&a,&acc,n,subtract,None);
+            }
+        }
+    }
+}
