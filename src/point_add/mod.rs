@@ -427,7 +427,7 @@ fn direct_const_halve_enabled() -> bool {
     // pair1_mul1 Karatsuba can hit a phase-cleanliness cliff on alternate
     // seeds.  Prefer the revived Karatsuba win by default; both knobs remain
     // independently overrideable for diagnostics.
-    env_flag_enabled("KAL_DIRECT_CONST_HALVE", !pair1_mul1_karatsuba_enabled(N))
+    env_flag_enabled("KAL_DIRECT_CONST_HALVE", true)
 }
 
 fn pair1_mul2_karatsuba_enabled(n: usize) -> bool {
@@ -1026,20 +1026,7 @@ fn cadd_nbit_const(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
 }
 
 fn csub_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
-    let n = acc.len();
-    let a = b.alloc_qubits(n);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    sub_nbit_qq_fast(b, &a, acc);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    b.free_vec(&a);
+    csub_nbit_const_direct_fast(b, acc, c, ctrl);
 }
 
 /// Controlled subtract of a classical constant without materializing the
@@ -1070,9 +1057,14 @@ fn csub_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
         if bit(c, i) {
             b.x(acc[i]);
             if let Some(bi) = borrow_in {
+                // majority(a, d, ctrl) = (a xor ctrl)(d xor ctrl) xor ctrl.
+                // Restore both inputs before the next borrow stage.
+                b.cx(ctrl, acc[i]);
+                b.cx(ctrl, bi);
                 b.ccx(acc[i], bi, target);
-                b.ccx(ctrl, acc[i], target);
-                b.ccx(ctrl, bi, target);
+                b.cx(ctrl, target);
+                b.cx(ctrl, bi);
+                b.cx(ctrl, acc[i]);
             } else {
                 b.ccx(acc[i], ctrl, target);
             }
@@ -1155,9 +1147,12 @@ fn cadd_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
         let carry_in = if i == 0 { None } else { Some(carries[i - 1]) };
         if bit(c, i) {
             if let Some(ci) = carry_in {
+                b.cx(ctrl, acc[i]);
+                b.cx(ctrl, ci);
                 b.ccx(acc[i], ci, target);
-                b.ccx(ctrl, acc[i], target);
-                b.ccx(ctrl, ci, target);
+                b.cx(ctrl, target);
+                b.cx(ctrl, ci);
+                b.cx(ctrl, acc[i]);
             } else {
                 b.ccx(acc[i], ctrl, target);
             }
@@ -1790,9 +1785,11 @@ fn mod_add_qq_fast(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
         b.free(q_clean2[1]);
     } else {
         let n1 = acc_ext.len();
-        let ca = load_const(b, n1, c);
-        add_nbit_qq_fast(b, &ca, &acc_ext);
-        unload_const(b, &ca, c);
+        let one = b.alloc_qubit();
+        b.x(one);
+        cadd_nbit_const_direct_fast(b, &acc_ext[..n1], c, one);
+        b.x(one);
+        b.free(one);
     }
     let flag = b.alloc_qubit();
     b.cx(acc_ovf, flag);
@@ -1814,19 +1811,7 @@ fn mod_add_qq_fast(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
         b.free(q_clean2[1]);
     } else {
         let n1 = acc_ext.len();
-        let ca = b.alloc_qubits(n1);
-        for i in 0..n1 {
-            if bit(c, i) {
-                b.cx(flag, ca[i]);
-            }
-        }
-        sub_nbit_qq_fast(b, &ca, &acc_ext);
-        for i in 0..n1 {
-            if bit(c, i) {
-                b.cx(flag, ca[i]);
-            }
-        }
-        b.free_vec(&ca);
+        csub_nbit_const_direct_fast(b, &acc_ext[..n1], c, flag);
     }
     b.x(flag);
     b.cx(flag, acc_ovf);
@@ -1874,9 +1859,11 @@ fn mod_add_qq_fast_from_zero(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256)
         b.free(q_clean2[1]);
     } else {
         let n1 = acc_ext.len();
-        let ca = load_const(b, n1, c);
-        add_nbit_qq_fast(b, &ca, &acc_ext);
-        unload_const(b, &ca, c);
+        let one = b.alloc_qubit();
+        b.x(one);
+        cadd_nbit_const_direct_fast(b, &acc_ext[..n1], c, one);
+        b.x(one);
+        b.free(one);
     }
     let flag = b.alloc_qubit();
     b.cx(acc_ovf, flag);
@@ -1897,19 +1884,7 @@ fn mod_add_qq_fast_from_zero(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256)
         b.free(q_clean2[1]);
     } else {
         let n1 = acc_ext.len();
-        let ca = b.alloc_qubits(n1);
-        for i in 0..n1 {
-            if bit(c, i) {
-                b.cx(flag, ca[i]);
-            }
-        }
-        sub_nbit_qq_fast(b, &ca, &acc_ext);
-        for i in 0..n1 {
-            if bit(c, i) {
-                b.cx(flag, ca[i]);
-            }
-        }
-        b.free_vec(&ca);
+        csub_nbit_const_direct_fast(b, &acc_ext[..n1], c, flag);
     }
     b.x(flag);
     b.cx(flag, acc_ovf);
@@ -3893,7 +3868,7 @@ fn mulmod(a: U256, b: U256, p: U256) -> U256 {
 /// (since max(r,s) doubles per iter starting from max=1, so max ≤ 2^iter_idx).
 /// In that range, mod_double(r)'s Solinas cadd is identity — replace with
 /// a plain shift (0 Toffoli) for ~255 CCX savings per iter.
-const R_SMALL_THRESHOLD: usize = 262;
+const R_SMALL_THRESHOLD: usize = 256;
 
 fn r_small_threshold() -> usize {
     std::env::var("KAL_R_SMALL_THRESHOLD")
@@ -9983,6 +9958,73 @@ fn build_compact_point_add(
     b.free_vec(&inv_rxqx);
 }
 
+// Exact computational-basis constant propagation. Quantum input registers
+// are unknown; unused ancillas start at zero. Measurements remain in-stream.
+fn fold_basis_constants(ops: &mut Vec<Op>, width: usize) {
+    use crate::circuit::{NO_BIT, NO_QUBIT};
+    let mut known = vec![Some(false); width];
+    let mut depth = 0usize;
+    let mut removed = 0usize;
+    for op in ops.iter_mut() {
+        let q = op.q_target;
+        let unconditional = depth == 0 && op.c_condition == NO_BIT;
+        match op.kind {
+            OperationType::AppendToRegister if q != NO_QUBIT => known[q.0 as usize] = None,
+            OperationType::PushCondition => depth += 1,
+            OperationType::PopCondition => depth -= 1,
+            OperationType::CCX | OperationType::CX => {
+                let c1 = known[op.q_control1.0 as usize];
+                let c2 = if op.kind == OperationType::CCX {
+                    known[op.q_control2.0 as usize]
+                } else { Some(true) };
+                if c1 == Some(false) || c2 == Some(false) {
+                    // Mark an identity with an otherwise unused metadata kind.
+                    op.kind = OperationType::DebugPrint;
+                    removed += 1;
+                    continue;
+                }
+                if c1 == Some(true) && c2 == Some(true) {
+                    op.kind = OperationType::X;
+                    op.q_control1 = NO_QUBIT;
+                    op.q_control2 = NO_QUBIT;
+                } else if op.kind == OperationType::CCX {
+                    if c1 == Some(true) {
+                        op.kind = OperationType::CX;
+                        op.q_control1 = op.q_control2;
+                        op.q_control2 = NO_QUBIT;
+                    } else if c2 == Some(true) {
+                        op.kind = OperationType::CX;
+                        op.q_control2 = NO_QUBIT;
+                    }
+                }
+                if op.kind == OperationType::X && unconditional {
+                    known[q.0 as usize] = known[q.0 as usize].map(|v| !v);
+                } else { known[q.0 as usize] = None; }
+            }
+            OperationType::X => {
+                known[q.0 as usize] = if unconditional {
+                    known[q.0 as usize].map(|v| !v)
+                } else { None };
+            }
+            OperationType::Swap => {
+                if unconditional { known.swap(q.0 as usize, op.q_control1.0 as usize); }
+                else {
+                    known[q.0 as usize] = None;
+                    known[op.q_control1.0 as usize] = None;
+                }
+            }
+            OperationType::R | OperationType::Hmr => {
+                if unconditional { known[q.0 as usize] = Some(false); }
+                else { known[q.0 as usize] = None; }
+            }
+            _ => {}
+        }
+    }
+    // No DebugPrint instructions are emitted by the production builder.
+    ops.retain(|op| op.kind != OperationType::DebugPrint);
+    eprintln!("basis folding: removed {} identity gates", removed);
+}
+
 pub fn build() -> Vec<Op> {
     let b = &mut B::new();
     // Register 0: target_x (quantum)
@@ -10284,5 +10326,8 @@ pub fn build() -> Vec<Op> {
         }
     }
 
-    b.ops.clone()
+    let mut ops = std::mem::take(&mut b.ops);
+    fold_basis_constants(&mut ops, b.next_qubit as usize);
+    eprintln!("peak phase={} width={}", b.peak_phase, b.peak_qubits);
+    ops
 }
