@@ -128,3 +128,44 @@ of rare phase failures with correct coordinates and final zero ancillas.
 Successful 9,024-shot runs do not prove those inherited iteration limits safe
 for all inputs. No failing variant was submitted; the public notes explicitly
 record this limitation. A stronger completion bound remains future work.
+
+## Adaptive workspace and a larger completion margin
+
+`0d343168-1229-4a10-9734-6307707664c9` promoted the shorter spill shift at
+3,918,719 Toffolis, 2,479 qubits, score 9,714,504,401 (source `bed83c8`).
+
+A subsequent local candidate passes at 4,067,987 Toffolis, 2,350 qubits,
+score 9,559,769,450 with both inversion limits increased to 408. It chooses
+pure or measured adders/comparators from static builder occupancy, using a
+2,350-qubit soft geometry budget. This is an algorithm-selection budget,
+not an input-dependent branch or mathematical truncation threshold.
+
+Sparse constants can be segmented into a low addition and controlled tail
+increment. For a controlled increment, the low-block carry-out can be erased
+using control AND (low result == 0). For decrement use control AND (low result
+== all ones). The existing measurement-clean zero test supplies that predicate
+without loading a full comparison constant. Recurse only through the intended
+high correction wrappers; keep core ripple functions available to avoid
+unbounded decomposition. Dense constants fall back to their core arithmetic.
+
+The sparse negation identity is `p-v = ~(v + (2^256-p)-1)`. This avoids treating
+p+1 as a dense addend. It preserves the predecessor's noncanonical p output
+when v=0, which its callers already expect.
+
+Lambda is zero after the normal second-inversion multiplication and cleanup.
+Free it there, before the backward inversion, rather than retaining 256 zero
+wires to the end. Guard the final free to avoid freeing its recycled IDs twice.
+Other experimental architecture branches retain their original final cleanup.
+
+Noncompetitive but passing local comparisons:
+
+- Sparse unconditional constants alone: score 9,717,694,874 at 2,479 qubits.
+- 2,450 soft budget, 408 steps: score 9,805,741,294 at 2,461 qubits.
+- 2,350 budget with blocked increment but no adaptive controlled ladder or
+  early lambda release: score 9,892,136,511 at 2,459 qubits.
+
+The 408-step setting is a larger fixed finite margin than 404/400. It is not
+the theoretical 512-step bound and does not establish universal completion.
+Independent tests now exercise both low-occupancy measured and high-occupancy
+unitary routes, sparse controlled constants, high-occupancy field operations,
+modular shifts, and strict zero-before-reset assertions.

@@ -386,6 +386,10 @@ fn emit_inverse<F: FnOnce(&mut B)>(b: &mut B, f: F) {
 
 pub const N: usize = 256;
 
+// Choose lower-workspace arithmetic only where a fast temporary would exceed
+// this geometry budget. This does not depend on arithmetic input values.
+const WORKSPACE_SOFT_LIMIT: usize = 2350;
+
 /// secp256k1 prime:  p = 2^256 - 2^32 - 977.
 pub const SECP256K1_P: U256 = U256::from_limbs([
     0xFFFFFFFEFFFFFC2F,
@@ -804,10 +808,10 @@ fn mod_sub_qq_fast(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
 
 /// Fast mod_neg using measurement-based Cuccaro for the addition.
 fn mod_neg_inplace_fast(b: &mut B, v: &[QubitId], p: U256) {
-    for &q in v {
-        b.x(q);
-    }
-    add_nbit_const_direct(b, v, p.wrapping_add(U256::from(1)));
+    // p-v = ~(v + (2^n-p)-1), avoiding a dense p+1 constant.
+    let correction = U256::MAX.wrapping_sub(p);
+    add_nbit_const_direct(b, v, correction);
+    for &q in v { b.x(q); }
 }
 
 fn mod_add_qc(b: &mut B, acc: &[QubitId], c: U256, p: U256) {
@@ -1049,12 +1053,32 @@ fn cuccaro_sub_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
 /// Fast `acc += a mod 2^n` using measurement-based Cuccaro.
 fn add_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     assert!(a.len() == acc.len() || a.len() + 1 == acc.len());
+    if b.active_qubits as usize + acc.len().saturating_sub(1) > WORKSPACE_SOFT_LIMIT {
+        let pad = if a.len() < acc.len() { Some(b.alloc_qubit()) } else { None };
+        let mut extended = a.to_vec();
+        if let Some(q) = pad { extended.push(q); }
+        let cin = b.alloc_qubit();
+        cuccaro_add(b, &extended, acc, cin);
+        b.free(cin);
+        if let Some(q) = pad { b.free(q); }
+        return;
+    }
     cuccaro_add_fast_zero(b, a, acc);
 }
 
 /// Fast `acc -= a mod 2^n` using measurement-based Cuccaro.
 fn sub_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     assert!(a.len() == acc.len() || a.len() + 1 == acc.len());
+    if b.active_qubits as usize + acc.len().saturating_sub(1) > WORKSPACE_SOFT_LIMIT {
+        let pad = if a.len() < acc.len() { Some(b.alloc_qubit()) } else { None };
+        let mut extended = a.to_vec();
+        if let Some(q) = pad { extended.push(q); }
+        let cin = b.alloc_qubit();
+        cuccaro_sub(b, &extended, acc, cin);
+        b.free(cin);
+        if let Some(q) = pad { b.free(q); }
+        return;
+    }
     cuccaro_sub_fast_zero(b, a, acc);
 }
 
@@ -1166,6 +1190,51 @@ fn csub_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
 /// count is essentially unchanged.
 fn csub_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
     let n = acc.len();
+    if c == U256::from(1u64) && n >= 16
+        && b.active_qubits as usize + n-1 > WORKSPACE_SOFT_LIMIT {
+        let split = (b.active_qubits as usize + n)
+            .saturating_sub(WORKSPACE_SOFT_LIMIT).saturating_add(2).max(2).min(n/2);
+        let overflow = b.alloc_qubit();
+        let mut low = acc[..split].to_vec(); low.push(overflow);
+        csub_nbit_const_direct_fast_core(b, &low, c, ctrl);
+        csub_nbit_const_direct_fast_core(b, &acc[split..], c, overflow);
+        let flag = b.alloc_qubit();
+        for &q in &acc[..split] { b.x(q); }
+        with_eq_zero_fast(b, &acc[..split], flag, |b| {
+            b.ccx(ctrl, flag, overflow);
+        });
+        for &q in &acc[..split] { b.x(q); }
+        b.free(flag);
+        b.free(overflow);
+        return;
+    }
+
+    let m = (0..n.min(256)).rev().find(|&i| bit(c,i)).map(|i| i+1).unwrap_or(0);
+    if m == 0 { return; }
+    if m >= 2 && 3*m < n && n-m <= 256
+        && b.active_qubits as usize + n.saturating_sub(1) > WORKSPACE_SOFT_LIMIT {
+        let overflow = b.alloc_qubit();
+        let mut low = acc[..m].to_vec(); low.push(overflow);
+        csub_nbit_const_direct_fast_core(b, &low, c, ctrl);
+        csub_nbit_const_direct_fast(b, &acc[m..], U256::from(1u64), overflow);
+        let threshold = (U256::from(1u64)<<m).wrapping_sub(c);
+        let ca = load_const(b, m, threshold);
+        let flag = b.alloc_qubit();
+        cmp_lt_into_fast(b, &acc[..m], &ca, flag);
+        b.x(flag);
+        b.ccx(ctrl, flag, overflow);
+        b.x(flag);
+        cmp_lt_into_fast(b, &acc[..m], &ca, flag);
+        b.free(flag);
+        unload_const(b, &ca, threshold);
+        b.free(overflow);
+        return;
+    }
+    csub_nbit_const_direct_fast_core(b, acc, c, ctrl);
+}
+
+fn csub_nbit_const_direct_fast_core(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
+    let n = acc.len();
     if n == 0 {
         return;
     }
@@ -1245,6 +1314,47 @@ fn cadd_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
 /// This is the carry analogue of [`csub_nbit_const_direct_fast`].
 fn cadd_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
     let n = acc.len();
+    if c == U256::from(1u64) && n >= 16
+        && b.active_qubits as usize + n-1 > WORKSPACE_SOFT_LIMIT {
+        let split = (b.active_qubits as usize + n)
+            .saturating_sub(WORKSPACE_SOFT_LIMIT).saturating_add(2).max(2).min(n/2);
+        let overflow = b.alloc_qubit();
+        let mut low = acc[..split].to_vec(); low.push(overflow);
+        cadd_nbit_const_direct_fast_core(b, &low, c, ctrl);
+        cadd_nbit_const_direct_fast_core(b, &acc[split..], c, overflow);
+        let flag = b.alloc_qubit();
+        with_eq_zero_fast(b, &acc[..split], flag, |b| {
+            b.ccx(ctrl, flag, overflow);
+        });
+        b.free(flag);
+        b.free(overflow);
+        return;
+    }
+
+    let m = (0..n.min(256)).rev().find(|&i| bit(c,i)).map(|i| i+1).unwrap_or(0);
+    if m == 0 { return; }
+    if m >= 2 && 3*m < n && n-m <= 256
+        && b.active_qubits as usize + n.saturating_sub(1) > WORKSPACE_SOFT_LIMIT {
+        let overflow = b.alloc_qubit();
+        let mut low = acc[..m].to_vec(); low.push(overflow);
+        cadd_nbit_const_direct_fast_core(b, &low, c, ctrl);
+        cadd_nbit_const_direct_fast(b, &acc[m..], U256::from(1u64), overflow);
+        let threshold = c;
+        let ca = load_const(b, m, threshold);
+        let flag = b.alloc_qubit();
+        cmp_lt_into_fast(b, &acc[..m], &ca, flag);
+        b.ccx(ctrl, flag, overflow);
+        cmp_lt_into_fast(b, &acc[..m], &ca, flag);
+        b.free(flag);
+        unload_const(b, &ca, threshold);
+        b.free(overflow);
+        return;
+    }
+    cadd_nbit_const_direct_fast_core(b, acc, c, ctrl);
+}
+
+fn cadd_nbit_const_direct_fast_core(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
+    let n = acc.len();
     if n == 0 {
         return;
     }
@@ -1319,10 +1429,30 @@ fn cadd_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
 /// Measurement variant of the linear ladder in Algorithm 4 of
 /// Remaud & Vandaele, arXiv:2501.16802v2. Saved original targets enable
 /// measurement uncomputation of each nonlinear ladder update.
+fn controlled_add_unitary(b: &mut B, a: &[QubitId], acc: &[QubitId], ctrl: QubitId) {
+    let n = acc.len();
+    assert_eq!(a.len(), n);
+    if n == 0 { return; }
+    for i in 1..n { b.cx(a[i], acc[i]); }
+    for i in (2..n).rev() { b.cx(a[i-1], a[i]); }
+    for i in 1..n { b.ccx(a[i-1], acc[i-1], a[i]); }
+    for i in 1..n { b.ccx(ctrl, a[i], acc[i]); }
+    for i in 1..n.saturating_sub(1) { b.cx(ctrl, acc[i]); }
+    for i in (1..n).rev() { b.ccx(a[i-1], acc[i-1], a[i]); }
+    for i in 1..n.saturating_sub(1) { b.cx(ctrl, acc[i]); }
+    for i in 2..n { b.cx(a[i-1], a[i]); }
+    b.ccx(ctrl, a[0], acc[0]);
+    for i in 1..n { b.cx(a[i], acc[i]); }
+}
+
 fn controlled_add_linear_workspace(b: &mut B, a: &[QubitId], acc: &[QubitId], ctrl: QubitId) {
     let n = acc.len();
     assert_eq!(a.len(), n);
     if n == 0 { return; }
+    if b.active_qubits as usize + n-1 > WORKSPACE_SOFT_LIMIT {
+        controlled_add_unitary(b, a, acc, ctrl);
+        return;
+    }
     for i in 1..n { b.cx(a[i], acc[i]); }
     for i in (2..n).rev() { b.cx(a[i-1], a[i]); }
     let saved = b.alloc_qubits(n-1);
@@ -1410,7 +1540,27 @@ fn sub_zero_extended(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     for &q in acc { b.x(q); }
 }
 
+/// Segment sparse constants to avoid carrying workspace across the zero tail.
 fn add_nbit_const_direct(b: &mut B, acc: &[QubitId], c: U256) {
+    let n = acc.len();
+    let m = (0..n.min(256)).rev().find(|&i| bit(c,i)).map(|i| i+1).unwrap_or(0);
+    if m == 0 { return; }
+    if m >= 2 && 3*m < n && n-m <= 256
+        && b.active_qubits as usize + n.saturating_sub(1) > WORKSPACE_SOFT_LIMIT {
+        let overflow = b.alloc_qubit();
+        let mut low = acc[..m].to_vec(); low.push(overflow);
+        add_nbit_const_direct_core(b, &low, c);
+        cadd_nbit_const_direct_fast(b, &acc[m..], U256::from(1u64), overflow);
+        let ca = load_const(b, m, c);
+        cmp_lt_into_fast(b, &acc[..m], &ca, overflow);
+        unload_const(b, &ca, c);
+        b.free(overflow);
+        return;
+    }
+    add_nbit_const_direct_core(b, acc, c);
+}
+
+fn add_nbit_const_direct_core(b: &mut B, acc: &[QubitId], c: U256) {
     let n = acc.len();
     if n == 0 { return; }
     if n == 1 { if bit(c, 0) { b.x(acc[0]); } return; }
@@ -1922,6 +2072,10 @@ fn cmp_lt_into_fast(b: &mut B, u: &[QubitId], v: &[QubitId], flag: QubitId) {
         return;
     }
     let n = u.len();
+    if b.active_qubits as usize + n > WORKSPACE_SOFT_LIMIT {
+        cmp_lt_into(b, u, v, flag);
+        return;
+    }
     assert_eq!(n, v.len());
     let carries = b.alloc_qubits(n);
     for i in 0..n {
@@ -9423,19 +9577,10 @@ fn build_standard_point_add(
     let pair1_iters = std::env::var("KAL_PAIR1_ITERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(404);
-    // The tagged validation paths change the op stream / Fiat-Shamir seed;
-    // keep pair2 at the prior robust 404 setting to avoid conflating the
-    // algebra probe with an iteration-threshold phase cliff.  Env overrides are
-    // for approximate-correctness threshold research only; default remains the
-    // exact checked setting.  For the normal exact path, full-harness probes
-    // after the R_SMALL_THRESHOLD=260 update found pair2=400 clean; pair2=399
-    // remains outside the verified safety margin.
-    let pair2_default = if tagged_div_validate || pair2_branch_inv {
-        404
-    } else {
-        400
-    };
+        .unwrap_or(408);
+    // A larger fixed completion margin than the inherited 404/400 settings.
+    // This remains a finite margin, not the theoretical 512-step bound.
+    let pair2_default = 408;
     let pair2_iters = std::env::var("KAL_PAIR2_ITERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -9745,6 +9890,7 @@ fn build_standard_point_add(
         });
     }
     let lam: Vec<QubitId> = lam_cell.into_inner().expect("lam set");
+    let mut lam_freed = false;
 
     if affine_combined_y {
         square_tx_and_combined_ty_l2minus3qx(b, &tx, &ty, &lam, &ox, p);
@@ -9855,13 +10001,17 @@ fn build_standard_point_add(
                     pair2_mul_add_into_acc(b, &lam, inv_raw, &ty, p);
                     b.set_phase("pair2_cleanup");
                     mod_sub_qb(b, &ty, &oy, p);
+                    // Lambda is zero here; release it before reloading the
+                    // denominator state for the backward inversion.
+                    b.free_vec(&lam);
+                    lam_freed = true;
                     b.set_phase("pair2_kaliski_backward");
                 });
             }
         }
     }
     mod_add_qb(b, &tx, &ox, p);
-    b.free_vec(&lam);
+    if !lam_freed { b.free_vec(&lam); }
 }
 
 fn build_compact_point_add(

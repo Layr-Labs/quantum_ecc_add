@@ -269,9 +269,11 @@ fn large_measured_controlled_add() {
     let mut seed=Shake256::default();
     seed.update(b"measurement controlled ladder independent large tests");
     let mut input=seed.finalize_xof();
+    for occupied in [0usize,2200] {
     for n in [8usize,32,128,256] {
         for subtract in [false,true] {
             let mut b=B::new();
+            let _occupied=b.alloc_qubits(occupied);
             let ctrl=b.alloc_qubit();
             let a=b.alloc_qubits(n);
             let acc=b.alloc_qubits(n);
@@ -302,7 +304,7 @@ fn large_measured_controlled_add() {
                 }
             }
         }
-    }
+    }    }
 }
 
 #[test]
@@ -342,6 +344,89 @@ fn modular_shift_measured_roundtrip() {
             for q in 0..b.next_qubit {
                 if !v.contains(&QubitId(q)) {assert_eq!(sim.qubits[q as usize],0);}
             }
+        }
+    }
+}
+
+#[test]
+fn large_sparse_controlled_constants() {
+    let mut seed=Shake256::default();seed.update(b"sparse controlled constant coverage");
+    let mut input=seed.finalize_xof();
+    for n in [8usize,32,128,256] {
+        let mask=if n==256 {U256::MAX} else {(U256::from(1u64)<<n)-U256::from(1u64)};
+        for c in [U256::from(1u64),U256::from(3u64),U256::from(5u64),U256::from(977u64),U256::from(0x1000003d1u64)] {
+            let c=c & mask;
+            for subtract in [false,true] {
+                let mut b=B::new();
+                let _occupied=b.alloc_qubits(2200);
+                let ctrl=b.alloc_qubit();let acc=b.alloc_qubits(n);
+                if subtract {csub_nbit_const_direct_fast(&mut b,&acc,c,ctrl);}
+                else {cadd_nbit_const_direct_fast(&mut b,&acc,c,ctrl);}
+                let rr:Vec<_>=acc.iter().copied().map(QubitOrBit::Qubit).collect();
+                let mut xof=Shake256::default().finalize_xof();
+                let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+                for _ in 0..16 {
+                    sim.clear_for_shot();sim.qubits[ctrl.0 as usize]=0xaaaaaaaaaaaaaaaa;
+                    let mut before=Vec::new();
+                    for lane in 0..64 {
+                        let mut bytes=[0u8;32];input.read(&mut bytes);
+                        let rv=match lane/2 {0=>U256::ZERO,1=>U256::from(1u64),2=>mask,3=>c,4=>c.wrapping_sub(U256::from(1u64))&mask,_=>U256::from_le_bytes(bytes)&mask};
+                        before.push(rv);sim.set_register(&rr,rv,lane);
+                    }
+                    apply_clean(&mut sim,&b.ops);assert_eq!(sim.phase,0);
+                    assert_eq!(sim.qubit(ctrl),0xaaaaaaaaaaaaaaaa);
+                    for lane in 0..64 {
+                        let addend=if lane&1==1 {c} else {U256::ZERO};
+                        let rv=before[lane];
+                        let expected=if subtract {rv.wrapping_sub(addend)} else {rv.wrapping_add(addend)} & mask;
+                        assert_eq!(sim.get_register(&rr,lane),expected,"sparse n={n} c={c} sub={subtract} lane={lane}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn high_occupancy_field_arithmetic() {
+    let p=SECP256K1_P;
+    let mut seed=Shake256::default();seed.update(b"occupied field arithmetic coverage");
+    let mut input=seed.finalize_xof();
+    for mode in 0..3 {
+        let mut b=B::new();
+        let padding=b.alloc_qubits(2100);
+        let a=b.alloc_qubits(256);
+        let acc=b.alloc_qubits(256);
+        match mode {
+            0=>mod_add_qq_fast(&mut b,&acc,&a,p),
+            1=>mod_sub_qq_fast(&mut b,&acc,&a,p),
+            _=>mod_neg_inplace_fast(&mut b,&acc,p),
+        }
+        let ar:Vec<_>=a.iter().copied().map(QubitOrBit::Qubit).collect();
+        let rr:Vec<_>=acc.iter().copied().map(QubitOrBit::Qubit).collect();
+        let mut xof=Shake256::default().finalize_xof();
+        let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+        for _ in 0..16 {
+            sim.clear_for_shot();let mut before=Vec::new();
+            for lane in 0..64 {
+                let mut bytes=[0u8;32];input.read(&mut bytes);
+                let av=match lane/2 {0=>U256::ZERO,1=>p-U256::from(1u64),2=>U256::from(1u64),_=>U256::from_le_bytes(bytes)%p};
+                input.read(&mut bytes);
+                let rv=match lane/2 {0=>U256::ZERO,1=>p-U256::from(1u64),2=>p-U256::from(1u64),_=>U256::from_le_bytes(bytes)%p};
+                before.push((av,rv));sim.set_register(&ar,av,lane);sim.set_register(&rr,rv,lane);
+            }
+            apply_clean(&mut sim,&b.ops);assert_eq!(sim.phase,0);
+            for lane in 0..64 {
+                let (av,rv)=before[lane];
+                let expected=match mode {
+                    0=>rv.add_mod(av,p),
+                    1=>if rv>=av {rv-av} else {p-(av-rv)},
+                    _=>p-rv,
+                };
+                assert_eq!(sim.get_register(&rr,lane),expected,"field mode={mode} lane={lane}");
+                assert_eq!(sim.get_register(&ar,lane),av);
+            }
+            for q in &padding {assert_eq!(sim.qubit(*q),0);}
         }
     }
 }
