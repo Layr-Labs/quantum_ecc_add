@@ -572,3 +572,32 @@ fn wide_short_addend_roundtrip() {
         for lane in 0..64 {let(av,lo,hi,top)=before[lane];assert_eq!(sim.get_register(&ar,lane),av);assert_eq!(sim.get_register(&rr[..256],lane),lo);assert_eq!(sim.get_register(&rr[256..512],lane),hi);assert_eq!((sim.qubit(acc[512])>>lane)&1,top);}
     }
 }
+
+#[test]
+fn clean_modular_scaling() {
+    let p=SECP256K1_P;let mut seed=Shake256::default();seed.update(b"clean modular scaling independent vectors");let mut input=seed.finalize_xof();
+    for steps in [1usize,4,22,64,408] {
+        let factor=pow_mod_2_k(p,steps);let reciprocal=classical_modinv(factor,p);
+        for inverse in [false,true] {
+            let mut b=B::new();let value=b.alloc_qubits(256);
+            clean_scale::many(&mut b,&value,p,steps,inverse);
+            let boundary=b.ops.len();clean_scale::many(&mut b,&value,p,steps,!inverse);
+            let vr:Vec<_>=value.iter().copied().map(QubitOrBit::Qubit).collect();
+            let mut xof=Shake256::default().finalize_xof();let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+            for _ in 0..8 {
+                sim.clear_for_shot();let mut before=Vec::new();
+                for lane in 0..64 {
+                    let mut bytes=[0u8;32];input.read(&mut bytes);
+                    let v=match lane {0=>U256::ZERO,1=>U256::from(1u64),2=>p-U256::from(1u64),3=>p>>1,4=>(p>>1)+U256::from(1u64),5=>reciprocal,6=>factor,_=>U256::from_le_bytes(bytes)%p};
+                    before.push(v);sim.set_register(&vr,v,lane);
+                }
+                apply_clean(&mut sim,&b.ops[..boundary]);assert_eq!(sim.phase,0,"scale steps={steps} inverse={inverse}");
+                for lane in 0..64 {assert_eq!(sim.get_register(&vr,lane),mulmod(before[lane],if inverse {reciprocal}else{factor},p),"scale steps={steps} inv={inverse} lane={lane}");}
+                for q in 0..b.next_qubit {if !value.contains(&QubitId(q)) {assert_eq!(sim.qubits[q as usize],0,"scale garbage q={q}");}}
+                apply_clean(&mut sim,&b.ops[boundary..]);assert_eq!(sim.phase,0);
+                for lane in 0..64 {assert_eq!(sim.get_register(&vr,lane),before[lane]);}
+                for q in 0..b.next_qubit {if !value.contains(&QubitId(q)) {assert_eq!(sim.qubits[q as usize],0);}}
+            }
+        }
+    }
+}

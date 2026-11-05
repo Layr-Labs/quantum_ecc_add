@@ -169,3 +169,33 @@ the theoretical 512-step bound and does not establish universal completion.
 Independent tests now exercise both low-occupancy measured and high-occupancy
 unitary routes, sparse controlled constants, high-occupancy field operations,
 modular shifts, and strict zero-before-reset assertions.
+
+## Direct classical offsets and clean scaling
+
+Subsequent promoted steps include direct classical-offset field arithmetic,
+classical preprocessing of 2*Qx and 3*Qx, and removal of copied pad/carry wires
+in the multiplication kernel. Their public notes contain the full results.
+The carry-one and biased-kernel tests preserve the multiplier's actual
+control-zero increment 2^n-x, not an uncorrected signed subtraction.
+
+The clean scaling implementation in clean_scale.rs removes the Bennett spill
+and reduction flags from an in-place power-of-two field shift. For
+p=2^256-c, output R, quotient q, and original captured spill s:
+
+- R = 2^k*v - q*p, with 0<=q<2^k.
+- R mod 2^k = c*q mod 2^k, so q follows from the inverse of odd c.
+- s = q - delta, with delta = [R < c*q].
+
+The forward helper turns spill into q, erases delta by comparing R with c*q,
+and subtracts inverse(c)*R_low from q modulo 2^k. The reverse helper computes
+q and delta from its input, reconstructs spill/flag, and invokes the existing
+explicit reverse shift. Product temporaries are computed and uncomputed
+with the sparse c = 1+2^4-2^6+2^10+2^32 decomposition. No target values are
+read by the builder; q is computed by quantum-controlled constant arithmetic.
+
+The tested implementation uses blocks up to 64 bits and replaces only lambda
+normalization walks. It does not replace coefficient doubling inside Kaliski.
+Independent tests include zero, p-1, values near p/2, and inputs mapping to
+small outputs such as one, so the reduction flag's rare branch is exercised.
+The 408-step normalization and its reverse are checked with exact classical
+field references, zero phase, all ancillas zero, and zero-before-reset checks.

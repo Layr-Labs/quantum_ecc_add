@@ -70,6 +70,7 @@ use crate::sim::Simulator;
 use crate::weierstrass_elliptic_curve::WeierstrassEllipticCurve;
 
 mod classical_offset;
+mod clean_scale;
 mod fermat_inv;
 mod venting;
 
@@ -1840,7 +1841,8 @@ fn mod_halve_no_corr(b: &mut B, v: &[QubitId]) {
 /// be passed to mod_shift_right_by_k for cleanup. Bennett-pattern: flags
 /// stay alive across the body so the inverse can cleanly cancel them.
 ///
-/// k must be small enough that spill·c < p. For k≤22 with secp256k1 this holds.
+/// k must satisfy spill*c < p. The k<=64 blocks used by clean scaling
+/// satisfy this comfortably for secp256k1 (the product has at most 97 bits).
 fn lowq_shift22() -> bool {
     // Qubit-first default: the global LOWQ shift22 path is strict-clean on the
     // current scaffold and lowers the benchmark peak (2736q -> 2715q) at a
@@ -9626,9 +9628,7 @@ fn build_standard_point_add(
             (&lam_coeff, &ty_coeff),
             |b| {
                 b.set_phase("pair1_branch_term_roll_halve");
-                for _ in 0..pair1_iters {
-                    mod_halve_inplace_fast(b, &lam_inner, p);
-                }
+                clean_scale::many(b, &lam_inner, p, pair1_iters, true);
                 b.set_phase("pair1_branch_term_roll_untag_lam");
                 mod_add_qc(b, &lam_inner, U256::from(1u64), p);
                 *lam_cell.borrow_mut() = Some(lam_inner);
@@ -9644,9 +9644,7 @@ fn build_standard_point_add(
         b.set_phase("pair1_kaliski_branch_term");
         with_kal_branch_term_tagged_div(b, &tx, p, pair1_iters, (&lam_coeff, &ty_coeff), |b| {
             b.set_phase("pair1_branch_term_halve");
-            for _ in 0..pair1_iters {
-                mod_halve_inplace_fast(b, &lam_inner, p);
-            }
+            clean_scale::many(b, &lam_inner, p, pair1_iters, true);
             b.set_phase("pair1_branch_term_untag_lam");
             mod_add_qc(b, &lam_inner, U256::from(1u64), p);
             *lam_cell.borrow_mut() = Some(lam_inner);
@@ -9662,9 +9660,7 @@ fn build_standard_point_add(
         b.set_phase("pair1_kaliski_branch_stream");
         with_kal_branch_stream_tagged_div(b, &tx, p, pair1_iters, (&lam_coeff, &ty_coeff), |b| {
             b.set_phase("pair1_branch_stream_halve");
-            for _ in 0..pair1_iters {
-                mod_halve_inplace_fast(b, &lam_inner, p);
-            }
+            clean_scale::many(b, &lam_inner, p, pair1_iters, true);
             b.set_phase("pair1_branch_stream_untag_lam");
             mod_add_qc(b, &lam_inner, U256::from(1u64), p);
             *lam_cell.borrow_mut() = Some(lam_inner);
@@ -9680,9 +9676,7 @@ fn build_standard_point_add(
         b.set_phase("pair1_kaliski_branch_hist_coeff");
         with_kal_branch_tagged_div_coeff(b, &tx, p, pair1_iters, (&lam_coeff, &ty_coeff), |b| {
             b.set_phase("pair1_branch_hist_halve");
-            for _ in 0..pair1_iters {
-                mod_halve_inplace_fast(b, &lam_inner, p);
-            }
+            clean_scale::many(b, &lam_inner, p, pair1_iters, true);
             b.set_phase("pair1_branch_hist_untag_lam");
             mod_add_qc(b, &lam_inner, U256::from(1u64), p);
             *lam_cell.borrow_mut() = Some(lam_inner);
@@ -9705,9 +9699,7 @@ fn build_standard_point_add(
             Some((&lam_coeff, &ty_coeff)),
             |b, _inv_raw| {
                 b.set_phase("pair1_coeff_channel_halve");
-                for _ in 0..pair1_iters {
-                    mod_halve_inplace_fast(b, &lam_inner, p);
-                }
+                clean_scale::many(b, &lam_inner, p, pair1_iters, true);
                 // lam_inner = -(lambda+1) after consuming tagged ty=(dy+dx).
                 // Add 1 to recover the normal lam_inner=-lambda expected by
                 // the remaining point-add scaffold.
@@ -9819,9 +9811,7 @@ fn build_standard_point_add(
         b.set_phase("pair1_outside_mul1");
         pair1_mul1_write_into_zero_acc(b, &lam_inner, &ty, &inv_keep, p);
         b.set_phase("pair1_outside_halve");
-        for _ in 0..pair1_iters {
-            mod_halve_inplace_fast(b, &lam_inner, p);
-        }
+        clean_scale::many(b, &lam_inner, p, pair1_iters, true);
         b.set_phase("pair1_outside_mul2");
         pair1_mul2_add_into_acc(b, &ty, &lam_inner, &tx, p);
         if kal_pair1_invkeep_skip_second_cleanup {
@@ -9849,9 +9839,7 @@ fn build_standard_point_add(
             b.set_phase("pair1_borrow_dx_mul1");
             pair1_mul1_write_into_zero_acc(b, &lam_inner, &ty, inv_raw, p);
             b.set_phase("pair1_borrow_dx_halve");
-            for _ in 0..pair1_iters {
-                mod_halve_inplace_fast(b, &lam_inner, p);
-            }
+            clean_scale::many(b, &lam_inner, p, pair1_iters, true);
             b.set_phase("pair1_borrow_dx_kaliski_backward");
             *lam_cell.borrow_mut() = Some(lam_inner);
         });
@@ -9862,9 +9850,7 @@ fn build_standard_point_add(
             b.set_phase("pair1_mul1");
             pair1_mul1_write_into_zero_acc(b, &lam_inner, &ty, inv_raw, p);
             b.set_phase("pair1_halve");
-            for _ in 0..pair1_iters {
-                mod_halve_inplace_fast(b, &lam_inner, p);
-            }
+            clean_scale::many(b, &lam_inner, p, pair1_iters, true);
             if affine_combined_y {
                 b.set_phase("pair1_mul2_deferred_combined_y");
             } else {
@@ -9916,9 +9902,7 @@ fn build_standard_point_add(
                 // lam cleanup. This targets qubit shape rather than Toffoli.
                 with_kal_branch_inv_raw_roll(b, &tx, p, pair2_iters, |b, inv_raw| {
                     b.set_phase("pair2_branch_inv_double");
-                    for _ in 0..pair2_iters {
-                        mod_double_inplace_fast(b, &lam, p);
-                    }
+                    clean_scale::many(b, &lam, p, pair2_iters, false);
                     b.set_phase("pair2_branch_inv_mul");
                     mod_mul_add_into_acc_schoolbook(b, &lam, inv_raw, &ty, p);
                     b.set_phase("pair2_branch_inv_cleanup");
@@ -9987,9 +9971,7 @@ fn build_standard_point_add(
             } else {
                 with_kal_inv_raw_borrow_v_w_pair(b, &tx, p, pair2_iters, KalPair::Pair2, |b, inv_raw| {
                     b.set_phase("pair2_double");
-                    for _ in 0..pair2_iters {
-                        mod_double_inplace_fast(b, &lam, p);
-                    }
+                    clean_scale::many(b, &lam, p, pair2_iters, false);
                     b.set_phase("pair2_mul");
                     pair2_mul_add_into_acc(b, &lam, inv_raw, &ty, p);
                     b.set_phase("pair2_cleanup");
