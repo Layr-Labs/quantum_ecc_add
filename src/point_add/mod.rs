@@ -1320,6 +1320,17 @@ fn add_zero_extended(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     let n = acc.len();
     assert!(a.len() <= n);
     if n == 0 { return; }
+    let m = a.len();
+    if m > 0 && m < n && n-m <= 256 {
+        let overflow = b.alloc_qubit();
+        let mut low = acc[..m].to_vec();
+        low.push(overflow);
+        add_nbit_qq_fast(b, a, &low);
+        cadd_nbit_const_direct_fast(b, &acc[m..], U256::from(1u64), overflow);
+        cmp_lt_into_fast(b, &acc[..m], a, overflow);
+        b.free(overflow);
+        return;
+    }
     let carry = b.alloc_qubits(n-1);
     for i in 0..n-1 {
         if i < a.len() {
@@ -2676,6 +2687,41 @@ fn karatsuba_half_sum_uncompute(b: &mut B, lo: &[QubitId], hi: &[QubitId], acc: 
     }
 }
 
+/// Borrow low input halves for the middle-product sums, then restore them.
+fn karatsuba_middle_product(
+    b: &mut B, xl: &[QubitId], xh: &[QubitId], yl: &[QubitId], yh: &[QubitId],
+    product: &[QubitId], inverse: bool,
+) {
+    let overlap = xl.iter().chain(xh.iter())
+        .any(|q| yl.contains(q) || yh.contains(q));
+    if overlap {
+        // The two sums cannot share borrowed input wires (e.g. squaring).
+        let xs = b.alloc_qubits(xl.len()+1);
+        let ys = b.alloc_qubits(yl.len()+1);
+        karatsuba_half_sum_compute(b, xl, xh, &xs);
+        karatsuba_half_sum_compute(b, yl, yh, &ys);
+        if inverse { schoolbook_mul_into_addsub_inverse(b, &xs, &ys, product); }
+        else { schoolbook_mul_into_addsub(b, &xs, &ys, product); }
+        karatsuba_half_sum_uncompute(b, yl, yh, &ys);
+        karatsuba_half_sum_uncompute(b, xl, xh, &xs);
+        b.free_vec(&ys);
+        b.free_vec(&xs);
+        return;
+    }
+    let xc = b.alloc_qubit();
+    let yc = b.alloc_qubit();
+    let mut xs = xl.to_vec(); xs.push(xc);
+    let mut ys = yl.to_vec(); ys.push(yc);
+    add_nbit_qq_fast(b, xh, &xs);
+    add_nbit_qq_fast(b, yh, &ys);
+    if inverse { schoolbook_mul_into_addsub_inverse(b, &xs, &ys, product); }
+    else { schoolbook_mul_into_addsub(b, &xs, &ys, product); }
+    sub_nbit_qq_fast(b, yh, &ys);
+    sub_nbit_qq_fast(b, xh, &xs);
+    b.free(yc);
+    b.free(xc);
+}
+
 fn karatsuba_forward(
     b: &mut B,
     x: &[QubitId],
@@ -2699,16 +2745,7 @@ fn karatsuba_forward(
         schoolbook_mul_into_addsub(b, &x_hi, &y_hi, &slice);
     }
 
-    let x_sum = b.alloc_qubits(h + 1);
-    let y_sum = b.alloc_qubits(h + 1);
-    karatsuba_half_sum_compute(b, &x_lo, &x_hi, &x_sum);
-    karatsuba_half_sum_compute(b, &y_lo, &y_hi, &y_sum);
-    // z1_reg width = 2*(h+1). Use addsub variant on (h+1)-sized inputs.
-    schoolbook_mul_into_addsub(b, &x_sum, &y_sum, z1_reg);
-    karatsuba_half_sum_uncompute(b, &y_lo, &y_hi, &y_sum);
-    karatsuba_half_sum_uncompute(b, &x_lo, &x_hi, &x_sum);
-    b.free_vec(&y_sum);
-    b.free_vec(&x_sum);
+    karatsuba_middle_product(b, &x_lo, &x_hi, &y_lo, &y_hi, z1_reg, false);
 
     {
         let pad = b.alloc_qubits(2);
@@ -2938,15 +2975,7 @@ fn karatsuba_inverse(
         b.free_vec(&pad);
     }
 
-    let x_sum = b.alloc_qubits(h + 1);
-    let y_sum = b.alloc_qubits(h + 1);
-    karatsuba_half_sum_compute(b, &x_lo, &x_hi, &x_sum);
-    karatsuba_half_sum_compute(b, &y_lo, &y_hi, &y_sum);
-    schoolbook_mul_into_addsub_inverse(b, &x_sum, &y_sum, z1_reg);
-    karatsuba_half_sum_uncompute(b, &y_lo, &y_hi, &y_sum);
-    karatsuba_half_sum_uncompute(b, &x_lo, &x_hi, &x_sum);
-    b.free_vec(&y_sum);
-    b.free_vec(&x_sum);
+    karatsuba_middle_product(b, &x_lo, &x_hi, &y_lo, &y_hi, z1_reg, true);
 
     {
         let slice: Vec<QubitId> = tmp_ext[2 * h..4 * h].to_vec();

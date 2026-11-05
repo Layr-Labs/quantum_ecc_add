@@ -43,7 +43,7 @@ fn check_all(b: &B, a: &[QubitId], acc: &[QubitId], n: usize,
             sim.set_register(&ar, U256::from(av), lane);
             sim.set_register(&rr, U256::from(rv), lane);
         }
-        sim.apply_iter(b.ops.iter());
+        apply_clean(&mut sim, &b.ops);
         let mask = if lanes == 64 { u64::MAX } else { (1u64 << lanes)-1 };
         assert_eq!(sim.phase & mask, 0, "phase n={n} subtract={subtract} c={constant:?}");
         for lane in 0..lanes {
@@ -101,7 +101,7 @@ fn large_direct_arithmetic_and_phase() {
                     sim.set_register(&ar, value & amask, lane);
                 }
                 let before: Vec<_> = (0..64).map(|lane| (sim.get_register(&ar,lane),sim.get_register(&rr,lane))).collect();
-                sim.apply_iter(b.ops.iter());
+                apply_clean(&mut sim, &b.ops);
                 assert_eq!(sim.phase,0,"large phase n={n} mode={mode}");
                 for lane in 0..64 {
                     let (av,rv) = before[lane];
@@ -133,7 +133,7 @@ fn exhaustive_controlled_constants() {
                 let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
                 sim.qubits[ctrl.0 as usize]=0xaaaaaaaaaaaaaaaa;
                 for lane in 0..64 { sim.set_register(&rr,U256::from((lane>>1)&((1usize<<n)-1)),lane); }
-                sim.apply_iter(b.ops.iter());
+                apply_clean(&mut sim, &b.ops);
                 assert_eq!(sim.phase,0,"controlled phase n={n} c={c} subtract={subtract}");
                 assert_eq!(sim.qubit(ctrl),0xaaaaaaaaaaaaaaaa);
                 for lane in 0..64 {
@@ -160,5 +160,64 @@ fn exhaustive_zero_extension() {
                 check_all(&b,&a,&acc,n,subtract,None);
             }
         }
+    }
+}
+
+#[test]
+fn exhaustive_small_karatsuba_roundtrip() {
+    // The inherited full multiplier requires distinct x/y wires. Its
+    // controlled add/subtract kernel is not a squaring primitive.
+    for same_inputs in [false] {
+        let n=4;
+        let mut b=B::new();
+        let x=b.alloc_qubits(n);
+        let y=if same_inputs {x.clone()} else {b.alloc_qubits(n)};
+        let out=b.alloc_qubits(2*n);
+        let middle=b.alloc_qubits(n+2);
+        karatsuba_forward(&mut b,&x,&y,&out,&middle);
+        let boundary=b.ops.len();
+        karatsuba_inverse(&mut b,&x,&y,&out,&middle);
+        let xr:Vec<_>=x.iter().copied().map(QubitOrBit::Qubit).collect();
+        let yr:Vec<_>=y.iter().copied().map(QubitOrBit::Qubit).collect();
+        let rr:Vec<_>=out.iter().copied().map(QubitOrBit::Qubit).collect();
+        let mut xof=Shake256::default().finalize_xof();
+        let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+        for first in (0..256usize).step_by(64) {
+            sim.clear_for_shot();
+            for lane in 0..64 {
+                let case=first+lane;
+                sim.set_register(&xr,U256::from(case>>n),lane);
+                if !same_inputs {sim.set_register(&yr,U256::from(case&15),lane);}
+            }
+            apply_clean(&mut sim, &b.ops[..boundary]);
+            assert_eq!(sim.phase,0,"karatsuba phase same_inputs={same_inputs} first={first}");
+            for lane in 0..64 {
+                let case=first+lane;
+                let xv=case>>n;
+                let yv=if same_inputs {xv} else {case&15};
+                assert_eq!(sim.get_register(&rr,lane),U256::from(xv*yv));
+                assert_eq!(sim.get_register(&xr,lane),U256::from(xv));
+                assert_eq!(sim.get_register(&yr,lane),U256::from(yv));
+            }
+            apply_clean(&mut sim, &b.ops[boundary..]);
+            assert_eq!(sim.phase,0);
+            for q in 0..b.next_qubit {
+                if !x.contains(&QubitId(q)) && !y.contains(&QubitId(q)) {
+                    assert_eq!(sim.qubits[q as usize],0);
+                }
+            }
+        }
+    }
+}
+
+// Reset in the simulator clears the qubit and may randomize phase. Check the
+// pre-reset value explicitly so a dirty temporary cannot pass by chance.
+fn apply_clean<R: XofReader>(sim: &mut Simulator<'_, R>, ops: &[Op]) {
+    assert!(!ops.iter().any(|o| matches!(o.kind, OperationType::PushCondition | OperationType::PopCondition)));
+    for op in ops {
+        if op.kind == OperationType::R {
+            assert_eq!(sim.qubit(op.q_target), 0, "dirty reset {:?}", op.q_target);
+        }
+        sim.apply_iter(std::iter::once(op));
     }
 }
