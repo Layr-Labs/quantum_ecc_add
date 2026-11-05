@@ -807,11 +807,7 @@ fn mod_neg_inplace_fast(b: &mut B, v: &[QubitId], p: U256) {
     for &q in v {
         b.x(q);
     }
-    let one = b.alloc_qubit();
-    b.x(one);
-    cadd_nbit_const_direct_fast(b, v, p.wrapping_add(U256::from(1)), one);
-    b.x(one);
-    b.free(one);
+    add_nbit_const_direct(b, v, p.wrapping_add(U256::from(1)));
 }
 
 fn mod_add_qc(b: &mut B, acc: &[QubitId], c: U256, p: U256) {
@@ -914,20 +910,152 @@ fn cuccaro_sub_fast(b: &mut B, a: &[QubitId], acc: &[QubitId], c_in: QubitId) {
     b.free_vec(&carries);
 }
 
+/// Zero-carry specialization; the first input supplies its carry copy.
+fn cuccaro_add_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
+    let n = acc.len();
+    assert!(a.len() == n || a.len() + 1 == n);
+    if n == 0 {
+        return;
+    }
+    if n == 1 {
+        b.cx(a[0], acc[0]);
+        return;
+    }
+
+    if a.len() + 1 == n {
+        if n == 2 {
+            b.ccx(a[0], acc[0], acc[1]);
+            b.cx(a[0], acc[0]);
+            return;
+        }
+        let carries = b.alloc_qubits(n - 2);
+        b.cx(a[0], acc[0]);
+        b.ccx(a[0], acc[0], carries[0]);
+        b.cx(carries[0], a[0]);
+        for i in 1..n-2 {
+            b.cx(a[i], acc[i]);
+            b.cx(a[i], a[i-1]);
+            b.ccx(a[i-1], acc[i], carries[i]);
+            b.cx(carries[i], a[i]);
+        }
+        maj(b, a[n-3], acc[n-2], a[n-2]);
+        b.cx(a[n-2], acc[n-1]);
+        uma(b, a[n-3], acc[n-2], a[n-2]);
+        for i in (1..n-2).rev() {
+            b.cx(carries[i], a[i]);
+            let m = b.alloc_bit();
+            b.hmr(carries[i], m);
+            b.cz_if(a[i-1], acc[i], m);
+            b.cx(a[i], a[i-1]);
+            b.cx(a[i-1], acc[i]);
+        }
+        b.cx(carries[0], a[0]);
+        let m = b.alloc_bit();
+        b.hmr(carries[0], m);
+        b.cz_if(a[0], acc[0], m);
+        b.free_vec(&carries);
+        return;
+    }
+
+    let carries = b.alloc_qubits(n - 1);
+
+    // Forward MAJ sweep with carry ancillae.
+    // Step 0: MAJ(c_in, acc[0], a[0]) → carry into carries[0]
+    b.cx(a[0], acc[0]);
+    b.ccx(a[0], acc[0], carries[0]);
+    b.cx(carries[0], a[0]);
+    // Steps 1..n-2: MAJ(a[i-1], acc[i], a[i]) → carry into carries[i]
+    for i in 1..n - 1 {
+        b.cx(a[i], acc[i]);
+        b.cx(a[i], a[i - 1]);
+        b.ccx(a[i - 1], acc[i], carries[i]);
+        b.cx(carries[i], a[i]);
+    }
+
+    // Final sum bit (same as original cuccaro_add)
+    b.cx(a[n - 2], acc[n - 1]);
+    if a.len() == n {
+        b.cx(a[n - 1], acc[n - 1]);
+    }
+
+    // Backward UMA sweep with measurement-based carry uncompute (0 Toffoli).
+    for i in (1..n - 1).rev() {
+        b.cx(carries[i], a[i]);
+        let m = b.alloc_bit();
+        b.hmr(carries[i], m);
+        b.cz_if(a[i - 1], acc[i], m);
+        b.cx(a[i], a[i - 1]);
+        b.cx(a[i - 1], acc[i]);
+    }
+    // Step 0 UMA:
+    b.cx(carries[0], a[0]);
+    let m0 = b.alloc_bit();
+    b.hmr(carries[0], m0);
+    b.cz_if(a[0], acc[0], m0);
+
+    b.free_vec(&carries);
+}
+
+/// Zero-carry specialization; the first input supplies its carry copy.
+fn cuccaro_sub_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
+    let n = acc.len();
+    assert!(a.len() == n || a.len() + 1 == n);
+    if n == 0 {
+        return;
+    }
+    if n == 1 {
+        b.cx(a[0], acc[0]);
+        return;
+    }
+
+    let carries = b.alloc_qubits(n - 1);
+
+    // Forward inv_UMA sweep with carry ancillae (reversed UMA from cuccaro_sub).
+    // Step 0:
+    b.ccx(a[0], acc[0], carries[0]);
+    b.cx(carries[0], a[0]);
+    // Steps 1..n-2:
+    for i in 1..n - 1 {
+        b.cx(a[i - 1], acc[i]);
+        b.cx(a[i], a[i - 1]);
+        b.ccx(a[i - 1], acc[i], carries[i]);
+        b.cx(carries[i], a[i]);
+    }
+
+    // Final sum bit (reversed from cuccaro_add)
+    if a.len() == n {
+        b.cx(a[n - 1], acc[n - 1]);
+    }
+    b.cx(a[n - 2], acc[n - 1]);
+
+    // Backward inv_MAJ sweep with measurement.
+    for i in (1..n - 1).rev() {
+        b.cx(carries[i], a[i]);
+        let m = b.alloc_bit();
+        b.hmr(carries[i], m);
+        b.cz_if(a[i - 1], acc[i], m);
+        b.cx(a[i], a[i - 1]);
+        b.cx(a[i], acc[i]);
+    }
+    b.cx(carries[0], a[0]);
+    let m0 = b.alloc_bit();
+    b.hmr(carries[0], m0);
+    b.cz_if(a[0], acc[0], m0);
+    b.cx(a[0], acc[0]);
+
+    b.free_vec(&carries);
+}
+
 /// Fast `acc += a mod 2^n` using measurement-based Cuccaro.
 fn add_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     assert!(a.len() == acc.len() || a.len() + 1 == acc.len());
-    let c_in = b.alloc_qubit();
-    cuccaro_add_fast(b, a, acc, c_in);
-    b.free(c_in);
+    cuccaro_add_fast_zero(b, a, acc);
 }
 
 /// Fast `acc -= a mod 2^n` using measurement-based Cuccaro.
 fn sub_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     assert!(a.len() == acc.len() || a.len() + 1 == acc.len());
-    let c_in = b.alloc_qubit();
-    cuccaro_sub_fast(b, a, acc, c_in);
-    b.free(c_in);
+    cuccaro_sub_fast_zero(b, a, acc);
 }
 
 /// `acc += a mod 2^n`. Caller must pre-extend both slices if they want the
@@ -1197,6 +1325,60 @@ fn cadd_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
     }
 
     b.free_vec(&carries);
+}
+
+/// Uncontrolled constant addition without a constant-control ancilla.
+fn add_nbit_const_direct(b: &mut B, acc: &[QubitId], c: U256) {
+    let n = acc.len();
+    if n == 0 { return; }
+    if n == 1 { if bit(c, 0) { b.x(acc[0]); } return; }
+    let carry = b.alloc_qubits(n - 2);
+    for i in 0..n-2 {
+        if bit(c, i) {
+            b.cx(acc[i], carry[i]);
+            if i > 0 {
+                b.cx(carry[i-1], carry[i]);
+                b.ccx(acc[i], carry[i-1], carry[i]);
+            }
+        } else if i > 0 { b.ccx(acc[i], carry[i-1], carry[i]); }
+    }
+    // Merge the final carry directly into the top output bit. The
+    // controls still hold their pre-sum values here, so this is unitary
+    // and needs neither an extra carry qubit nor its measurement.
+    if bit(c, n-2) { b.cx(acc[n-2], acc[n-1]); }
+    if n > 2 {
+        if bit(c, n-2) { b.cx(carry[n-3], acc[n-1]); }
+        b.ccx(acc[n-2], carry[n-3], acc[n-1]);
+    }
+    for i in 0..n {
+        if bit(c, i) { b.x(acc[i]); }
+        if i > 0 && i < n-1 { b.cx(carry[i-1], acc[i]); }
+    }
+    fn z_if(b: &mut B, q: QubitId, m: BitId) {
+        let mut op = Op::empty();
+        op.kind = OperationType::Z;
+        op.q_target = q;
+        op.c_condition = m;
+        b.ops.push(op);
+    }
+    for i in (0..n-2).rev() {
+        let m = b.alloc_bit();
+        b.hmr(carry[i], m);
+        if bit(c, i) {
+            b.x(acc[i]);
+            z_if(b, acc[i], m);
+            if i > 0 {
+                z_if(b, carry[i-1], m);
+                b.cz_if(acc[i], carry[i-1], m);
+            }
+            b.x(acc[i]);
+        } else if i > 0 {
+            b.x(acc[i]);
+            b.cz_if(acc[i], carry[i-1], m);
+            b.x(acc[i]);
+        }
+    }
+    b.free_vec(&carry);
 }
 
 fn add_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256) {
@@ -1782,11 +1964,7 @@ fn mod_add_qq_fast(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
         b.free(q_clean2[1]);
     } else {
         let n1 = acc_ext.len();
-        let one = b.alloc_qubit();
-        b.x(one);
-        cadd_nbit_const_direct_fast(b, &acc_ext[..n1], c, one);
-        b.x(one);
-        b.free(one);
+        add_nbit_const_direct(b, &acc_ext[..n1], c);
     }
     // The extension bit itself records reduction. The correction is
     // performed on the low register, so it can also serve as control.
@@ -1836,11 +2014,7 @@ fn mod_add_qq_fast_from_zero(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256)
         b.free(q_clean2[1]);
     } else {
         let n1 = acc_ext.len();
-        let one = b.alloc_qubit();
-        b.x(one);
-        cadd_nbit_const_direct_fast(b, &acc_ext[..n1], c, one);
-        b.x(one);
-        b.free(one);
+        add_nbit_const_direct(b, &acc_ext[..n1], c);
     }
     // The extension bit itself records reduction. The correction is
     // performed on the low register, so it can also serve as control.
@@ -10305,3 +10479,6 @@ pub fn build() -> Vec<Op> {
     eprintln!("peak phase={} width={}", b.peak_phase, b.peak_qubits);
     ops
 }
+
+#[cfg(test)]
+mod primitive_checks;
