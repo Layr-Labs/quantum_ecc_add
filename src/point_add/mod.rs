@@ -1463,6 +1463,12 @@ fn add_nbit_const_direct(b: &mut B, acc: &[QubitId], c: U256) {
     b.free_vec(&carry);
 }
 
+fn sub_nbit_const_direct(b: &mut B, acc: &[QubitId], c: U256) {
+    for &q in acc { b.x(q); }
+    add_nbit_const_direct(b, acc, c);
+    for &q in acc { b.x(q); }
+}
+
 fn add_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256) {
     let n = acc.len();
     let a = load_const(b, n, c);
@@ -1624,32 +1630,10 @@ fn mod_shift_left_by_k(
     let mut v_ext = v.to_vec();
     v_ext.push(ovf);
     let cuccaro_op = |b: &mut B, pos: usize, is_sub: bool| {
-        let pad_width = n + 1 - pos;
-        let padded = b.alloc_qubits(pad_width);
-        for i in 0..k.min(pad_width) {
-            b.cx(spill[i], padded[i]);
-        }
-        let v_slice: Vec<QubitId> = v_ext[pos..n + 1].to_vec();
-        let c_in = b.alloc_qubit();
-        if lowq_shift22() {
-            if is_sub {
-                cuccaro_sub(b, &padded, &v_slice, c_in);
-            } else {
-                cuccaro_add(b, &padded, &v_slice, c_in);
-            }
-        } else if is_sub {
-            // Fast cuccaro: saves ~n CCX per op. Peak during this op (~514
-            // transient) is still below the mod_add_qq_fast peak (517) inside
-            // the enclosing Solinas, so no global peak increase.
-            cuccaro_sub_fast(b, &padded, &v_slice, c_in);
-        } else {
-            cuccaro_add_fast(b, &padded, &v_slice, c_in);
-        }
-        b.free(c_in);
-        for i in 0..k.min(pad_width) {
-            b.cx(spill[i], padded[i]);
-        }
-        b.free_vec(&padded);
+        let v_slice = &v_ext[pos..n+1];
+        let source = &spill[..k.min(v_slice.len())];
+        if is_sub { sub_zero_extended(b, source, v_slice); }
+        else { add_zero_extended(b, source, v_slice); }
     };
     b.set_phase("shift22_cuccaro_op_0");
     cuccaro_op(b, 0, false);
@@ -1664,22 +1648,14 @@ fn mod_shift_left_by_k(
 
     // Step 3: const add.
     b.set_phase("shift22_step3");
-    if lowq_shift22() {
-        add_nbit_const(b, &v_ext, c);
-    } else {
-        add_nbit_const_fast(b, &v_ext, c);
-    }
+    add_nbit_const_direct(b, &v_ext, c);
     b.x(ovf);
     b.cx(ovf, flag_inv); // flag_inv = NOT(top_bit_after_add) = (value < p)
     b.x(ovf);
 
     // Step 4: conditional const sub.
     b.set_phase("shift22_step4");
-    if lowq_shift22() {
-        csub_nbit_const(b, &v_ext, c, flag_inv);
-    } else {
-        csub_nbit_const_fast(b, &v_ext, c, flag_inv);
-    }
+    csub_nbit_const_direct_fast(b, &v_ext, c, flag_inv);
     b.x(flag_inv);
     b.cx(flag_inv, ovf);
     b.x(flag_inv);
@@ -1709,50 +1685,23 @@ fn mod_shift_right_by_k(
     b.cx(flag_inv, ovf);
     b.x(flag_inv);
     b.set_phase("rshift22_rev_step4");
-    if lowq_shift22() {
-        cadd_nbit_const(b, &v_ext, c, flag_inv);
-    } else {
-        cadd_nbit_const_fast(b, &v_ext, c, flag_inv);
-    }
+    cadd_nbit_const_direct_fast(b, &v_ext, c, flag_inv);
 
     // Reverse step 3.
     b.x(ovf);
     b.cx(ovf, flag_inv);
     b.x(ovf);
     b.set_phase("rshift22_rev_step3");
-    if lowq_shift22() {
-        sub_nbit_const(b, &v_ext, c);
-    } else {
-        sub_nbit_const_fast(b, &v_ext, c);
-    }
+    sub_nbit_const_direct(b, &v_ext, c);
     b.free(flag_inv);
     b.set_phase("rshift22_rev_step2");
 
     // Reverse step 2: inverse of the consolidated op list (5 ops, in reverse order, flipped signs).
     let cuccaro_op = |b: &mut B, pos: usize, is_sub: bool| {
-        let pad_width = n + 1 - pos;
-        let padded = b.alloc_qubits(pad_width);
-        for i in 0..k.min(pad_width) {
-            b.cx(spill[i], padded[i]);
-        }
-        let v_slice: Vec<QubitId> = v_ext[pos..n + 1].to_vec();
-        let c_in = b.alloc_qubit();
-        if lowq_shift22() {
-            if is_sub {
-                cuccaro_sub(b, &padded, &v_slice, c_in);
-            } else {
-                cuccaro_add(b, &padded, &v_slice, c_in);
-            }
-        } else if is_sub {
-            cuccaro_sub_fast(b, &padded, &v_slice, c_in);
-        } else {
-            cuccaro_add_fast(b, &padded, &v_slice, c_in);
-        }
-        b.free(c_in);
-        for i in 0..k.min(pad_width) {
-            b.cx(spill[i], padded[i]);
-        }
-        b.free_vec(&padded);
+        let v_slice = &v_ext[pos..n+1];
+        let source = &spill[..k.min(v_slice.len())];
+        if is_sub { sub_zero_extended(b, source, v_slice); }
+        else { add_zero_extended(b, source, v_slice); }
     };
     // Reverse: undo ADD at 32, 10; undo SUB at 6; undo ADD at 4, 0.
     cuccaro_op(b, 32, true); // undo +spill·2^32

@@ -72,3 +72,59 @@ validator at the same 2,711-qubit score, before later overflow-control work.
 Do not edit the harness or score data to pursue these experiments. Keep scratch
 backups outside the checkout. Reproduce with the pinned Rust toolchain and the
 normal sandboxed `yukon run` pipeline; remote scoring remains authoritative.
+
+## Subsequent promoted frontier and measured controlled arithmetic
+
+Further promotions in this session:
+
+- `9f3aeba3-a6c6-40c4-93a8-7969f054d94c`: 3,943,905 Toffolis,
+  2,711 qubits, score 10,691,926,455 (overflow bit used as reduction control).
+- `9d0e5b43-42ce-44ea-8816-6d7810210eaf`: 3,943,927 Toffolis,
+  2,710 qubits, score 10,688,042,170 (zero-carry and constant-only adders).
+- `c0194a44-6c4d-4ec2-af62-d8ebab8e0e6f`: 3,940,907 Toffolis,
+  2,588 qubits, score 10,199,067,316 (zero-extended Karatsuba merge).
+- `44efa26f-fc51-49cb-96d3-27c80fce1015`: 3,941,951 Toffolis,
+  2,565 qubits, score 10,111,104,315 (borrowed low-half sums, segmented merge).
+- `dabbec86-75aa-4a53-9998-dc713f92c373`: 3,942,299 Toffolis,
+  2,483 qubits, score 9,788,728,417 (measured controlled inversion arithmetic).
+- `451b38a0-52e4-47f1-804e-ecaf79763071`: 3,938,207 Toffolis,
+  2,480 qubits, score 9,766,753,360 (fast post-shift modular addition).
+
+The controlled-ripple structural source is Algorithm 4 of Remaud & Vandaele,
+https://arxiv.org/html/2501.16802v2 . The local measurement adaptation saves
+original nonlinear ladder targets, measures modified targets on cleanup,
+corrects the saved-value Z and control-product CZ phases, and restores the
+input wires from their saved values. It uses n-1 temporary qubits and 2n-1
+Toffolis per n-bit controlled modular-power-of-two addition. Subtraction uses
+complement/add/complement. Its integration replaces both controlled operations
+of Kaliski step 4 and their backward counterparts. Independent exhaustive and
+large-width tests, including zero-before-reset assertions, pass.
+
+A fully unitary ancilla-free version also passed the complete validator but
+scored 11,396,376,563 (4,589,761 Toffolis, 2,483 qubits), so it was not retained.
+
+The shorter-addend merge can use a segmented path: add into the low slice plus
+an overflow, conditionally increment the high tail, then compare low output
+against the unchanged addend to clear the overflow. This trades a comparator
+for fewer simultaneous carry wires. In-place middle-product half-sums borrow
+the low halves and restore them with subtraction after the middle product.
+The complete inherited multiplication kernel requires distinct input wires;
+it is not a squaring primitive when x and y are literally the same register.
+
+The shift spill additions can likewise use shorter-addend arithmetic instead
+of full zero padding. Generic modular shifts may contain measurements; retain
+the separate phase-clean shift implementations for callers requiring pure
+unitary gate reversal. The full shift roundtrip tests check multiplication by
+2^k modulo p, exact reverse identity, phase, and pre-reset zero values.
+
+## Concrete inherited termination witness
+
+A scratch diagnostic evaluator (not a harness edit) examined the failed direct
+constant-wrapper stream. It found nonzero qubit 1021 immediately before reset
+at batch 113, operation 19,975,038, lane mask 0x10000000. Builder metadata maps
+that qubit to v_w[0] at the end of the inherited 400-step second inversion.
+Thus that stream had an incomplete inversion cleanup. This explains a class
+of rare phase failures with correct coordinates and final zero ancillas.
+Successful 9,024-shot runs do not prove those inherited iteration limits safe
+for all inputs. No failing variant was submitted; the public notes explicitly
+record this limitation. A stronger completion bound remains future work.

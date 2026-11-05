@@ -304,3 +304,44 @@ fn large_measured_controlled_add() {
         }
     }
 }
+
+#[test]
+fn modular_shift_measured_roundtrip() {
+    let mut seed=Shake256::default(); seed.update(b"shift roundtrip independent inputs");
+    let mut input=seed.finalize_xof();
+    let p=SECP256K1_P;
+    for k in [1usize,4,22] {
+        let mut b=B::new();
+        let v=b.alloc_qubits(256);
+        let (spill,flag,overflow)=mod_shift_left_by_k(&mut b,&v,p,k);
+        let boundary=b.ops.len();
+        mod_shift_right_by_k(&mut b,&v,p,k,spill,flag,overflow);
+        let vr:Vec<_>=v.iter().copied().map(QubitOrBit::Qubit).collect();
+        let mut xof=Shake256::default().finalize_xof();
+        let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+        for _ in 0..16 {
+            sim.clear_for_shot();
+            let mut before=Vec::new();
+            for lane in 0..64 {
+                let mut bytes=[0u8;32];input.read(&mut bytes);
+                let val=match lane {
+                    0=>U256::ZERO,1=>U256::from(1u64),2=>p-U256::from(1u64),
+                    3=>p>>1,4=>(p>>1)+U256::from(1u64),_=>U256::from_le_bytes(bytes)%p,
+                };
+                before.push(val);
+                sim.set_register(&vr,val,lane);
+            }
+            apply_clean(&mut sim,&b.ops[..boundary]);
+            assert_eq!(sim.phase,0,"shift phase k={k}");
+            for lane in 0..64 {
+                assert_eq!(sim.get_register(&vr,lane),mulmod(before[lane],U256::from(1u64)<<k,p),"shift k={k} lane={lane}");
+            }
+            apply_clean(&mut sim,&b.ops[boundary..]);
+            assert_eq!(sim.phase,0,"reverse shift phase k={k}");
+            for lane in 0..64 {assert_eq!(sim.get_register(&vr,lane),before[lane]);}
+            for q in 0..b.next_qubit {
+                if !v.contains(&QubitId(q)) {assert_eq!(sim.qubits[q as usize],0);}
+            }
+        }
+    }
+}
