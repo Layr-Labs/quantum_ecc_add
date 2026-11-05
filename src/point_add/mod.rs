@@ -1192,12 +1192,13 @@ fn csub_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
     let n = acc.len();
     if c == U256::from(1u64) && n >= 16
         && b.active_qubits as usize + n-1 > WORKSPACE_SOFT_LIMIT {
-        let split = (b.active_qubits as usize + n)
-            .saturating_sub(WORKSPACE_SOFT_LIMIT).saturating_add(2).max(2).min(n/2);
+        let available = WORKSPACE_SOFT_LIMIT
+            .saturating_sub(b.active_qubits as usize + 3).max(2);
+        let split = available.min(n/2).max(2);
         let overflow = b.alloc_qubit();
         let mut low = acc[..split].to_vec(); low.push(overflow);
         csub_nbit_const_direct_fast_core(b, &low, c, ctrl);
-        csub_nbit_const_direct_fast_core(b, &acc[split..], c, overflow);
+        csub_nbit_const_direct_fast(b, &acc[split..], c, overflow);
         let flag = b.alloc_qubit();
         for &q in &acc[..split] { b.x(q); }
         with_eq_zero_fast(b, &acc[..split], flag, |b| {
@@ -1316,12 +1317,13 @@ fn cadd_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
     let n = acc.len();
     if c == U256::from(1u64) && n >= 16
         && b.active_qubits as usize + n-1 > WORKSPACE_SOFT_LIMIT {
-        let split = (b.active_qubits as usize + n)
-            .saturating_sub(WORKSPACE_SOFT_LIMIT).saturating_add(2).max(2).min(n/2);
+        let available = WORKSPACE_SOFT_LIMIT
+            .saturating_sub(b.active_qubits as usize + 3).max(2);
+        let split = available.min(n/2).max(2);
         let overflow = b.alloc_qubit();
         let mut low = acc[..split].to_vec(); low.push(overflow);
         cadd_nbit_const_direct_fast_core(b, &low, c, ctrl);
-        cadd_nbit_const_direct_fast_core(b, &acc[split..], c, overflow);
+        cadd_nbit_const_direct_fast(b, &acc[split..], c, overflow);
         let flag = b.alloc_qubit();
         with_eq_zero_fast(b, &acc[..split], flag, |b| {
             b.ccx(ctrl, flag, overflow);
