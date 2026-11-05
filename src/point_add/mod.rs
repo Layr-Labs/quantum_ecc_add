@@ -828,22 +828,13 @@ fn mod_add_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
 }
 
 fn mod_add_double_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
-    // acc := acc + 2*bits mod p. Reuse a single loaded copy of the classical
-    // point and walk it through the cheap secp256k1 double/halve pair.
-    let a = load_bits(b, bits);
-    mod_double_inplace_fast(b, &a, p);
-    mod_add_qq_fast(b, acc, &a, p);
-    mod_halve_inplace_fast(b, &a, p);
-    unload_bits(b, &a, bits);
+    let doubled = classical_offset::field_add_classical(b, bits, bits, p);
+    classical_offset::field_add(b, acc, &doubled, p);
 }
 
 fn mod_sub_double_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
-    // acc := acc - 2*bits mod p. Mirror of mod_add_double_qb.
-    let a = load_bits(b, bits);
-    mod_double_inplace_fast(b, &a, p);
-    mod_sub_qq_fast(b, acc, &a, p);
-    mod_halve_inplace_fast(b, &a, p);
-    unload_bits(b, &a, bits);
+    let doubled = classical_offset::field_add_classical(b, bits, bits, p);
+    classical_offset::field_sub(b, acc, &doubled, p);
 }
 
 fn mod_sub_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
@@ -3687,6 +3678,9 @@ fn square_tx_and_combined_ty_l2minus3qx(
     debug_assert_eq!(ty.len(), n);
     debug_assert_eq!(lam.len(), n);
 
+    let ox2 = classical_offset::field_add_classical(b, ox, ox, p);
+    let ox3 = classical_offset::field_add_classical(b, &ox2, ox, p);
+
     b.set_phase("affine_combined_square");
     let tmp_ext = b.alloc_qubits(2 * n);
     schoolbook_square_symmetric(b, lam, &tmp_ext);
@@ -3694,8 +3688,7 @@ fn square_tx_and_combined_ty_l2minus3qx(
     b.set_phase("affine_combined_breg_red");
     let breg = b.alloc_qubits(n);
     mod_add_solinas_ext_product(b, &breg, &tmp_ext, p);
-    mod_sub_double_qb(b, &breg, ox, p);
-    mod_sub_qb(b, &breg, ox, p);
+    mod_sub_qb(b, &breg, &ox3, p);
 
     b.set_phase("affine_combined_y_mul");
     if env_flag_enabled("POINT_ADD_AFFINE_COMBINED_Y_KARATSUBA_LOWQ", false) {
@@ -3705,15 +3698,13 @@ fn square_tx_and_combined_ty_l2minus3qx(
     }
 
     b.set_phase("affine_combined_breg_unred");
-    mod_add_qb(b, &breg, ox, p);
-    mod_add_double_qb(b, &breg, ox, p);
+    mod_add_qb(b, &breg, &ox3, p);
     mod_sub_solinas_ext_product(b, &breg, &tmp_ext, p);
     b.free_vec(&breg);
 
     b.set_phase("affine_combined_tx_update");
     mod_sub_solinas_ext_product(b, tx, &tmp_ext, p);
-    mod_add_double_qb(b, tx, ox, p);
-    mod_add_qb(b, tx, ox, p);
+    mod_add_qb(b, tx, &ox3, p);
     mod_neg_inplace_fast(b, tx, p);
 
     schoolbook_square_symmetric_inverse(b, lam, &tmp_ext);

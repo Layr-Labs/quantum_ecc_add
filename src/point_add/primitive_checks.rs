@@ -484,3 +484,30 @@ fn classical_offset_field_arithmetic() {
         }
     }
 }
+
+#[test]
+fn classical_offset_multiples() {
+    let p=SECP256K1_P;let mut b=B::new();let a=b.alloc_bits(256);
+    let twice=classical_offset::field_add_classical(&mut b,&a,&a,p);
+    let thrice=classical_offset::field_add_classical(&mut b,&twice,&a,p);
+    assert_eq!(b.next_qubit,0);
+    let ar:Vec<_>=a.iter().copied().map(QubitOrBit::Bit).collect();
+    let dr:Vec<_>=twice.iter().copied().map(QubitOrBit::Bit).collect();
+    let tr:Vec<_>=thrice.iter().copied().map(QubitOrBit::Bit).collect();
+    let mut seed=Shake256::default();seed.update(b"classical offset multiple coverage");let mut input=seed.finalize_xof();
+    let mut xof=Shake256::default().finalize_xof();let mut sim=Simulator::new(0,b.next_bit as usize,&mut xof);
+    for _ in 0..32 {
+        sim.clear_for_shot();let mut before=Vec::new();
+        for lane in 0..64 {
+            let mut bytes=[0u8;32];input.read(&mut bytes);
+            let av=match lane {0=>U256::ZERO,1=>U256::from(1u64),2=>p-U256::from(1u64),3=>p>>1,_=>U256::from_le_bytes(bytes)%p};
+            before.push(av);sim.set_register(&ar,av,lane);
+        }
+        apply_clean(&mut sim,&b.ops);assert_eq!(sim.phase,0);assert_eq!(sim.stats.toffoli_gates,0);
+        for lane in 0..64 {
+            let av=before[lane];assert_eq!(sim.get_register(&ar,lane),av);
+            assert_eq!(sim.get_register(&dr,lane),mulmod(av,U256::from(2u64),p));
+            assert_eq!(sim.get_register(&tr,lane),mulmod(av,U256::from(3u64),p));
+        }
+    }
+}
