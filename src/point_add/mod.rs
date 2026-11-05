@@ -807,10 +807,11 @@ fn mod_neg_inplace_fast(b: &mut B, v: &[QubitId], p: U256) {
     for &q in v {
         b.x(q);
     }
-    let n = v.len();
-    let ca = load_const(b, n, p.wrapping_add(U256::from(1)));
-    add_nbit_qq_fast(b, &ca, v);
-    unload_const(b, &ca, p.wrapping_add(U256::from(1)));
+    let one = b.alloc_qubit();
+    b.x(one);
+    cadd_nbit_const_direct_fast(b, v, p.wrapping_add(U256::from(1)), one);
+    b.x(one);
+    b.free(one);
 }
 
 fn mod_add_qc(b: &mut B, acc: &[QubitId], c: U256, p: U256) {
@@ -6324,6 +6325,18 @@ fn emit_centered_by_denom_controls_live_numerator_benchmark_scaffold(
 /// attempt did not preserve full point-add correctness, so this remains an
 /// experimental helper while the history/backward compatibility conditions are
 /// worked out.
+// The late denominator bound leaves v_w[width..] at zero. Step 4
+// accesses only v_w[..width], so the remaining wires are clean workspace.
+fn kaliski_step4_workspace(b: &mut B, v_w: &[QubitId], iter: usize)
+    -> (Vec<QubitId>, Vec<QubitId>) {
+    let n = v_w.len();
+    let width = if iter < n { n } else { 2 * n - iter };
+    let mut tmp = v_w[width..].to_vec();
+    let owned = b.alloc_qubits(n - tmp.len());
+    tmp.extend_from_slice(&owned);
+    (tmp, owned)
+}
+
 fn kaliski_iteration_bulk_prefix3(
     b: &mut B,
     p: U256,
@@ -6418,7 +6431,7 @@ fn kaliski_iteration_bulk_prefix3(
         // Before this fix: load_width = n, sub_width = max(2n-k, n) → load too wide.
         // After: load_width = sub_width = max(2n-iter_idx, n). Saves n CCX/qubits per iter.
         let load_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-        let tmp = b.alloc_qubits(n);
+        let (tmp, owned_tmp) = kaliski_step4_workspace(b, v_w, iter_idx);
         for i in 0..load_width {
             b.ccx(add_f, u[i], tmp[i]);
         }
@@ -6458,7 +6471,7 @@ fn kaliski_iteration_bulk_prefix3(
                 b.cz_if(add_f, u[i], m);
             }
         }
-        b.free_vec(&tmp);
+        b.free_vec(&owned_tmp);
     }
     if let Some((cr, cs)) = coeff {
         b.set_phase("kal_bulk_coeff_step4_add");
@@ -6639,7 +6652,7 @@ fn kaliski_iteration(
     // s and unload. Saves n CCX/iter.
     mcx2_polar(b, f, true, b_f, false, add_f);
     {
-        let tmp = b.alloc_qubits(n);
+        let (tmp, owned_tmp) = kaliski_step4_workspace(b, v_w, iter_idx);
         // Load tmp = add_f AND u. Late-iter bound: u[i]=0 for i >= 2n-iter.
         let load_width = if iter_idx < n { n } else { 2 * n - iter_idx };
         for i in 0..load_width {
@@ -6694,7 +6707,7 @@ fn kaliski_iteration(
             }
             // else: tmp[i]=0, no phase correction needed.
         }
-        b.free_vec(&tmp);
+        b.free_vec(&owned_tmp);
     }
     if let Some((cr, cs)) = coeff {
         b.set_phase("kal_coeff_step4_add");
@@ -6992,14 +7005,14 @@ fn free_kaliski_state(b: &mut B, st: KaliskiState) {
 fn kaliski_forward_with_coeff_caps(
     b: &mut B,
     v_in: &[QubitId],
-    st: &KaliskiState,
+    st: &mut KaliskiState,
     p: U256,
     iters: usize,
     coeff: Option<(&[QubitId], &[QubitId])>,
     bulk_caps: BulkPrefixCaps,
 ) {
     let n = v_in.len();
-    debug_assert!(iters <= st.m_hist.len());
+    
     if let Some((cr, cs)) = coeff {
         assert_eq!(cr.len(), n);
         assert_eq!(cs.len(), n);
@@ -7024,6 +7037,7 @@ fn kaliski_forward_with_coeff_caps(
     // ─── Iterations ───
     let use_bulk_prefix3 = bulk_prefix_enabled();
     for i in 0..iters {
+        if st.m_hist.len() <= i { st.m_hist.push(b.alloc_qubit()); }
         if use_bulk_prefix3 && i < bulk_caps.forward {
             kaliski_iteration_bulk_prefix3(
                 b,
@@ -7180,7 +7194,7 @@ fn kaliski_iteration_bulk_prefix3_backward(
     // Reverse STEP 4.
     b.set_phase("bk_bulk_step4");
     {
-        let tmp = b.alloc_qubits(n);
+        let (tmp, owned_tmp) = kaliski_step4_workspace(b, v_w, iter_idx);
         let load_width = if iter_idx + 1 < n { iter_idx + 1 } else { n };
         for i in 0..load_width {
             b.ccx(add_f, r[i], tmp[i]);
@@ -7228,7 +7242,7 @@ fn kaliski_iteration_bulk_prefix3_backward(
                 b.cz_if(add_f, r[i], m);
             }
         }
-        b.free_vec(&tmp);
+        b.free_vec(&owned_tmp);
     }
     b.cx(b_f, add_f);
     b.x(add_f);
@@ -7349,7 +7363,7 @@ fn kaliski_iteration_backward(
     b.set_phase("bk_step4");
     // Reverse STEP 4 (with measurement uncompute for unload) ─────────
     {
-        let tmp = b.alloc_qubits(n);
+        let (tmp, owned_tmp) = kaliski_step4_workspace(b, v_w, iter_idx);
         // Load tmp = AND(add_f, r). Small-iter: r[i]=0 for i >= iter+1.
         let load_width = if iter_idx + 1 < n { iter_idx + 1 } else { n };
         for i in 0..load_width {
@@ -7402,7 +7416,7 @@ fn kaliski_iteration_backward(
             }
             // else: tmp = 0, no phase.
         }
-        b.free_vec(&tmp);
+        b.free_vec(&owned_tmp);
     }
     // Reversed (A): measurement-uncompute add_f = f AND (NOT b_f)
     b.x(b_f);
@@ -7517,7 +7531,7 @@ fn kaliski_iteration_backward(
 fn kaliski_backward_caps(
     b: &mut B,
     v_in: &[QubitId],
-    st: &KaliskiState,
+    st: &mut KaliskiState,
     p: U256,
     iters: usize,
     bulk_caps: BulkPrefixCaps,
@@ -7552,6 +7566,7 @@ fn kaliski_backward_caps(
                 i,
             );
         }
+        b.free(st.m_hist.pop().expect("history step"));
     }
 
     // ─── Reverse Init ───
@@ -9115,7 +9130,7 @@ fn kaliski_xor_inv_raw_into_keep_alias_vw(
         );
     }
 
-    kaliski_forward_with_coeff_caps(b, v_in, &st, p, iters, None, bulk_caps);
+    kaliski_forward_with_coeff_caps(b, v_in, &mut st, p, iters, None, bulk_caps);
 
     // Free envelope components between forward and backward, mirroring
     // with_kal_inv_raw_coeff_caps.  v_w is never freed here because it aliases
@@ -9165,10 +9180,10 @@ fn kaliski_xor_inv_raw_into_keep_alias_vw(
 
     if std::env::var("KAL_BULK3_GENERALIZED_REVERSE").is_ok() {
         emit_inverse_hmr_safe(b, |b| {
-            kaliski_forward_with_coeff_caps(b, v_in, &st, p, iters, None, bulk_caps)
+            kaliski_forward_with_coeff_caps(b, v_in, &mut st, p, iters, None, bulk_caps)
         });
     } else {
-        kaliski_backward_caps(b, v_in, &st, p, iters, bulk_caps);
+        kaliski_backward_caps(b, v_in, &mut st, p, iters, bulk_caps);
     }
     b.free(st.f_flag);
     b.free_vec(&st.m_hist);
@@ -9211,6 +9226,8 @@ fn with_kal_inv_raw_coeff_caps<F: FnOnce(&mut B, &[QubitId])>(
 ) {
     let n = v_in.len();
     let mut st = alloc_kaliski_state(b, n, iters);
+    b.free_vec(&st.m_hist);
+    st.m_hist.clear();
     let keep_full_state = std::env::var("KAL_KEEP_FULL_STATE").ok().as_deref() == Some("1");
     let keep_u = keep_full_state || std::env::var("KAL_KEEP_U").ok().as_deref() == Some("1");
     let keep_v = keep_full_state || std::env::var("KAL_KEEP_V").ok().as_deref() == Some("1");
@@ -9225,7 +9242,7 @@ fn with_kal_inv_raw_coeff_caps<F: FnOnce(&mut B, &[QubitId])>(
     // If coeff is supplied, the same branch controls also transform that
     // external coefficient pair, but the ordinary qrisp sentinel state remains
     // available for clean branch-flag uncomputation.
-    kaliski_forward_with_coeff_caps(b, v_in, &st, p, iters, coeff, bulk_caps);
+    kaliski_forward_with_coeff_caps(b, v_in, &mut st, p, iters, coeff, bulk_caps);
 
     if !keep_v {
         b.free_vec(&st.v_w);
@@ -9277,14 +9294,14 @@ fn with_kal_inv_raw_coeff_caps<F: FnOnce(&mut B, &[QubitId])>(
     // single contract. The hope is to eliminate the residual phase mismatch.
     if std::env::var("KAL_BULK3_GENERALIZED_REVERSE").is_ok() {
         emit_inverse_hmr_safe(b, |b| {
-            kaliski_forward_with_coeff_caps(b, v_in, &st, p, iters, None, bulk_caps)
+            kaliski_forward_with_coeff_caps(b, v_in, &mut st, p, iters, None, bulk_caps)
         });
     } else {
         // Explicit backward pass (uses measurement-based uncompute, saves
         // ~511 CCX per iteration vs the emit_inverse version).  Use the same
         // promoted/pair-specific cap family selected for the forward pass so
         // a 378th bulk step can be enabled only where it is phase-clean.
-        kaliski_backward_caps(b, v_in, &st, p, iters, bulk_caps);
+        kaliski_backward_caps(b, v_in, &mut st, p, iters, bulk_caps);
     }
 
     free_kaliski_state(b, st);
