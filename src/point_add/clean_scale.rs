@@ -3,22 +3,22 @@ use super::*;
 
 pub(super) const BLOCK_SIZE: usize = 68;
 
-fn inverse_low_bits(c: U256, k: usize) -> U256 {
-    let mut inverse=U256::from(1u64);
-    for _ in 0..8 {
-        inverse=inverse.wrapping_mul(U256::from(2u64).wrapping_sub(c.wrapping_mul(inverse)));
-    }
-    let mask=(U256::from(1u64)<<k)-U256::from(1u64);
-    inverse &= mask;
-    assert_eq!(inverse.wrapping_mul(c)&mask,U256::from(1u64));
-    inverse
-}
-fn inverse_product(b: &mut B, value: &[QubitId], q: &[QubitId], inverse: U256, subtract: bool) {
-    let k=q.len();let mask=(U256::from(1u64)<<k)-U256::from(1u64);
-    for i in 0..k {
-        let constant=(inverse<<i)&mask;
-        if subtract {csub_nbit_const_direct_fast(b,q,constant,value[i]);}
-        else {cadd_nbit_const_direct_fast(b,q,constant,value[i]);}
+// Multiplication by an odd constant is triangular in binary. Descending
+// controlled additions preserve each original control bit. Ascending
+// subtractions reverse that circuit and divide by c modulo 2^k.
+fn multiply_odd(b: &mut B, q: &[QubitId], c: U256, inverse: bool) {
+    let extra=c-U256::from(1u64);
+    let k=q.len();
+    if inverse {
+        for i in 0..k-1 {
+            let mask=(U256::from(1u64)<<(k-i-1))-U256::from(1u64);
+            csub_nbit_const_direct_fast(b,&q[i+1..],(extra>>1)&mask,q[i]);
+        }
+    } else {
+        for i in (0..k-1).rev() {
+            let mask=(U256::from(1u64)<<(k-i-1))-U256::from(1u64);
+            cadd_nbit_const_direct_fast(b,&q[i+1..],(extra>>1)&mask,q[i]);
+        }
     }
 }
 fn short_term(b: &mut B, q: &[QubitId], target: &[QubitId], subtract: bool) {
@@ -53,7 +53,6 @@ fn below_product_into(b: &mut B, value: &[QubitId], product: &[QubitId], target:
 pub(super) fn left(b: &mut B, value: &[QubitId], p: U256, k: usize) {
     assert_eq!(p,SECP256K1_P);assert_eq!(value.len(),256);assert!(k>0&&k<=128);
     let c=U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1u64));
-    let inverse=inverse_low_bits(c,k);
     let (q,flag,overflow)=mod_shift_left_by_k(b,value,p,k);
     // flag is !reduce; the old top-bit spill plus reduce is the quotient q.
     b.x(flag);cadd_nbit_const_direct_fast(b,&q,U256::from(1u64),flag);
@@ -62,15 +61,18 @@ pub(super) fn left(b: &mut B, value: &[QubitId], p: U256, k: usize) {
     below_product_into(b,value,&product,flag);
     solinas_product(b,&q,&product,true);b.free_vec(&product);
     b.free(flag);b.free(overflow);
-    // value mod 2^k = c*q mod 2^k, so subtract its known inverse product.
-    inverse_product(b,value,&q,inverse,true);b.free_vec(&q);
+    // value mod 2^k = c*q mod 2^k: multiply then XOR to erase q.
+    multiply_odd(b,&q,c,false);
+    for i in 0..k {b.cx(value[i],q[i]);}
+    b.free_vec(&q);
 }
 
 pub(super) fn right(b: &mut B, value: &[QubitId], p: U256, k: usize) {
     assert_eq!(p,SECP256K1_P);assert_eq!(value.len(),256);assert!(k>0&&k<=128);
     let c=U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1u64));
-    let inverse=inverse_low_bits(c,k);
-    let q=b.alloc_qubits(k);inverse_product(b,value,&q,inverse,false);
+    let q=b.alloc_qubits(k);
+    for i in 0..k {b.cx(value[i],q[i]);}
+    multiply_odd(b,&q,c,true);
     let flag=b.alloc_qubit();let product=b.alloc_qubits(k+33);
     solinas_product(b,&q,&product,false);
     below_product_into(b,value,&product,flag);
