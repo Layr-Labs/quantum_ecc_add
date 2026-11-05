@@ -1316,6 +1316,47 @@ fn cadd_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
 
 /// Uncontrolled constant addition without a constant-control ancilla.
 /// Add a shorter quantum addend without materializing zero padding.
+/// Measurement variant of the linear ladder in Algorithm 4 of
+/// Remaud & Vandaele, arXiv:2501.16802v2. Saved original targets enable
+/// measurement uncomputation of each nonlinear ladder update.
+fn controlled_add_linear_workspace(b: &mut B, a: &[QubitId], acc: &[QubitId], ctrl: QubitId) {
+    let n = acc.len();
+    assert_eq!(a.len(), n);
+    if n == 0 { return; }
+    for i in 1..n { b.cx(a[i], acc[i]); }
+    for i in (2..n).rev() { b.cx(a[i-1], a[i]); }
+    let saved = b.alloc_qubits(n-1);
+    for i in 1..n {
+        b.cx(a[i], saved[i-1]);
+        b.ccx(a[i-1], acc[i-1], a[i]);
+    }
+    for i in 1..n { b.ccx(ctrl, a[i], acc[i]); }
+    for i in 1..n.saturating_sub(1) { b.cx(ctrl, acc[i]); }
+    for i in (1..n).rev() {
+        let m = b.alloc_bit();
+        b.hmr(a[i], m);
+        let mut z = Op::empty();
+        z.kind = OperationType::Z;
+        z.q_target = saved[i-1];
+        z.c_condition = m;
+        b.ops.push(z);
+        b.cz_if(a[i-1], acc[i-1], m);
+        b.cx(saved[i-1], a[i]);
+        b.cx(a[i], saved[i-1]);
+        b.free(saved[i-1]);
+    }
+    for i in 1..n.saturating_sub(1) { b.cx(ctrl, acc[i]); }
+    for i in 2..n { b.cx(a[i-1], a[i]); }
+    b.ccx(ctrl, a[0], acc[0]);
+    for i in 1..n { b.cx(a[i], acc[i]); }
+}
+
+fn controlled_sub_linear_workspace(b: &mut B, a: &[QubitId], acc: &[QubitId], ctrl: QubitId) {
+    for &q in acc { b.x(q); }
+    controlled_add_linear_workspace(b, a, acc, ctrl);
+    for &q in acc { b.x(q); }
+}
+
 fn add_zero_extended(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     let n = acc.len();
     assert!(a.len() <= n);
@@ -6610,51 +6651,10 @@ fn kaliski_iteration_bulk_prefix3(
     b.cx(b_f, add_f);
     {
         let n = u.len();
-        // Narrow load/sub width to the late-iter bound (same formula as sub_width).
-        // Before this fix: load_width = n, sub_width = max(2n-k, n) → load too wide.
-        // After: load_width = sub_width = max(2n-iter_idx, n). Saves n CCX/qubits per iter.
-        let load_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-        let (tmp, owned_tmp) = kaliski_step4_workspace(b, v_w, iter_idx);
-        for i in 0..load_width {
-            b.ccx(add_f, u[i], tmp[i]);
-        }
-        // Narrow load/sub width to the late-iter bound.
-        // Both tmp and v_w are 256 qubits. Use slice [0..load_width] for each.
-        sub_nbit_qq_fast(b, &tmp[..load_width], &v_w[..load_width]);
-        let transform_width = if iter_idx + 1 < n { iter_idx + 1 } else { n };
-        for i in 0..transform_width {
-            b.cx(r[i], u[i]);
-        }
-        for i in 0..transform_width {
-            b.ccx(add_f, u[i], tmp[i]);
-        }
-        for i in 0..transform_width {
-            b.cx(r[i], u[i]);
-        }
-        let add_width = if iter_idx + 2 < n { iter_idx + 2 } else { n };
-        let mut tmp_slice: Vec<QubitId> = tmp[0..transform_width].to_vec();
-        let tmp_pad = if add_width > transform_width {
-            let q = b.alloc_qubit();
-            tmp_slice.push(q);
-            Some(q)
-        } else {
-            None
-        };
-        let s_slice: Vec<QubitId> = s[0..add_width].to_vec();
-        add_nbit_qq_fast(b, &tmp_slice, &s_slice);
-        if let Some(q) = tmp_pad {
-            b.free(q);
-        }
-        for i in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(tmp[i], m);
-            if i < transform_width {
-                b.cz_if(add_f, r[i], m);
-            } else {
-                b.cz_if(add_f, u[i], m);
-            }
-        }
-        b.free_vec(&owned_tmp);
+        let dw = if iter_idx < n { n } else { 2*n-iter_idx };
+        let cw = (iter_idx+2).min(n);
+        controlled_sub_linear_workspace(b, &u[..dw], &v_w[..dw], add_f);
+        controlled_add_linear_workspace(b, &r[..cw], &s[..cw], add_f);
     }
     if let Some((cr, cs)) = coeff {
         b.set_phase("kal_bulk_coeff_step4_add");
@@ -6835,62 +6835,11 @@ fn kaliski_iteration(
     // s and unload. Saves n CCX/iter.
     mcx2_polar(b, f, true, b_f, false, add_f);
     {
-        let (tmp, owned_tmp) = kaliski_step4_workspace(b, v_w, iter_idx);
-        // Load tmp = add_f AND u. Late-iter bound: u[i]=0 for i >= 2n-iter.
-        let load_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-        for i in 0..load_width {
-            b.ccx(add_f, u[i], tmp[i]);
-        }
-        // Sub v_w -= tmp. Late-iter: both high bits 0, truncate to load_width.
-        let tmp_sub_slice: Vec<QubitId> = tmp[0..load_width].to_vec();
-        let v_w_sub_slice: Vec<QubitId> = v_w[0..load_width].to_vec();
-        sub_nbit_qq_fast(b, &tmp_sub_slice, &v_w_sub_slice);
-        // Transform tmp from "add_f AND u" to "add_f AND r".
-        // Small-iter: only the low iter+1 bits of r can be nonzero; the
-        // carry slot for s += r is handled by an explicit 0 pad instead of a
-        // useless extra CCX on a known-zero r bit.
-        // Late-iter: full transform (r unbounded but u high bits 0 so CCX at
-        // high bits effectively produces add_f AND r from tmp=0).
-        let transform_width = if iter_idx + 1 < n { iter_idx + 1 } else { n };
-        for i in 0..transform_width {
-            b.cx(r[i], u[i]);
-        }
-        for i in 0..transform_width {
-            b.ccx(add_f, u[i], tmp[i]);
-        }
-        for i in 0..transform_width {
-            b.cx(r[i], u[i]);
-        }
-        // Add s += tmp. Small-iter still needs one extra carry slot above the
-        // live r bits, but that top input bit is known 0.
-        let add_width = if iter_idx + 2 < n { iter_idx + 2 } else { n };
-        let mut tmp_slice: Vec<QubitId> = tmp[0..transform_width].to_vec();
-        let tmp_pad = if add_width > transform_width {
-            let q = b.alloc_qubit();
-            tmp_slice.push(q);
-            Some(q)
-        } else {
-            None
-        };
-        let s_slice: Vec<QubitId> = s[0..add_width].to_vec();
-        add_nbit_qq_fast(b, &tmp_slice, &s_slice);
-        if let Some(q) = tmp_pad {
-            b.free(q);
-        }
-        // Unload: bits < transform_width have tmp = add_f AND r;
-        // bits [transform_width..load_width) have tmp = add_f AND u (transform skipped, load done);
-        // bits >= load_width have tmp = 0 (load skipped).
-        for i in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(tmp[i], m);
-            if i < transform_width {
-                b.cz_if(add_f, r[i], m);
-            } else if i < load_width {
-                b.cz_if(add_f, u[i], m);
-            }
-            // else: tmp[i]=0, no phase correction needed.
-        }
-        b.free_vec(&owned_tmp);
+        let n = u.len();
+        let dw = if iter_idx < n { n } else { 2*n-iter_idx };
+        let cw = (iter_idx+2).min(n);
+        controlled_sub_linear_workspace(b, &u[..dw], &v_w[..dw], add_f);
+        controlled_add_linear_workspace(b, &r[..cw], &s[..cw], add_f);
     }
     if let Some((cr, cs)) = coeff {
         b.set_phase("kal_coeff_step4_add");
@@ -7377,55 +7326,11 @@ fn kaliski_iteration_bulk_prefix3_backward(
     // Reverse STEP 4.
     b.set_phase("bk_bulk_step4");
     {
-        let (tmp, owned_tmp) = kaliski_step4_workspace(b, v_w, iter_idx);
-        let load_width = if iter_idx + 1 < n { iter_idx + 1 } else { n };
-        for i in 0..load_width {
-            b.ccx(add_f, r[i], tmp[i]);
-        }
-        let sub_width = if iter_idx + 2 < n { iter_idx + 2 } else { n };
-        let tmp_sub_slice: Vec<QubitId> = tmp[0..sub_width].to_vec();
-        let s_slice: Vec<QubitId> = s[0..sub_width].to_vec();
-        if std::env::var("KAL_VENT_MODADD").ok().as_deref() == Some("1") {
-            sub_nbit_qq(b, &tmp_sub_slice, &s_slice);
-        } else {
-            sub_nbit_qq_fast(b, &tmp_sub_slice, &s_slice);
-        }
-        // Late-iter denominator bits above 2n-iter_idx are known zero.  The
-        // high tmp bits loaded from r only participate in the s-subtraction;
-        // they do not need to be transformed into add_f&u or added back into
-        // v_w.  This mirrors `kaliski_iteration_backward` and saves one CCX
-        // plus two CX per skipped high bit in the bulk reverse tail.
-        let transform_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-        for i in 0..transform_width {
-            b.cx(r[i], u[i]);
-        }
-        for i in 0..transform_width {
-            b.ccx(add_f, u[i], tmp[i]);
-        }
-        for i in 0..transform_width {
-            b.cx(r[i], u[i]);
-        }
-        // After transforming tmp from r to u, high bits of tmp above the
-        // late-iter denominator width are known zero.  Truncate the reverse
-        // add into v_w just like the generic backward iteration does.
-        let add_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-        let tmp_add_slice: Vec<QubitId> = tmp[0..add_width].to_vec();
-        let v_w_slice: Vec<QubitId> = v_w[0..add_width].to_vec();
-        if std::env::var("KAL_VENT_MODADD").ok().as_deref() == Some("1") {
-            add_nbit_qq(b, &tmp_add_slice, &v_w_slice);
-        } else {
-            add_nbit_qq_fast(b, &tmp_add_slice, &v_w_slice);
-        }
-        for i in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(tmp[i], m);
-            if i < transform_width {
-                b.cz_if(add_f, u[i], m);
-            } else if i < load_width {
-                b.cz_if(add_f, r[i], m);
-            }
-        }
-        b.free_vec(&owned_tmp);
+        let n = u.len();
+        let dw = if iter_idx < n { n } else { 2*n-iter_idx };
+        let cw = (iter_idx+2).min(n);
+        controlled_sub_linear_workspace(b, &r[..cw], &s[..cw], add_f);
+        controlled_add_linear_workspace(b, &u[..dw], &v_w[..dw], add_f);
     }
     b.cx(b_f, add_f);
     b.x(add_f);
@@ -7546,60 +7451,11 @@ fn kaliski_iteration_backward(
     b.set_phase("bk_step4");
     // Reverse STEP 4 (with measurement uncompute for unload) ─────────
     {
-        let (tmp, owned_tmp) = kaliski_step4_workspace(b, v_w, iter_idx);
-        // Load tmp = AND(add_f, r). Small-iter: r[i]=0 for i >= iter+1.
-        let load_width = if iter_idx + 1 < n { iter_idx + 1 } else { n };
-        for i in 0..load_width {
-            b.ccx(add_f, r[i], tmp[i]);
-        }
-        // Reversed (F): sub tmp from s. Small-iter width iter+2.
-        let sub_width = if iter_idx + 2 < n { iter_idx + 2 } else { n };
-        let tmp_sub_slice: Vec<QubitId> = tmp[0..sub_width].to_vec();
-        let s_slice: Vec<QubitId> = s[0..sub_width].to_vec();
-        if std::env::var("KAL_VENT_MODADD").ok().as_deref() == Some("1") {
-            sub_nbit_qq(b, &tmp_sub_slice, &s_slice);
-        } else {
-            sub_nbit_qq_fast(b, &tmp_sub_slice, &s_slice);
-        }
-        // Reversed (E): transform tmp from AND(add_f,r) → AND(add_f,u).
-        // Late-iter: u high bits 0, so transform at those bits: cx(r,u=0)→u=r,
-        //   ccx(add_f, u=r, tmp) flips tmp. tmp goes 0 → add_f AND r. Not what we
-        //   want (need add_f AND u=0). For late iter, truncate transform to uv_width.
-        let transform_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-        for i in 0..transform_width {
-            b.cx(r[i], u[i]);
-        }
-        for i in 0..transform_width {
-            b.ccx(add_f, u[i], tmp[i]);
-        }
-        for i in 0..transform_width {
-            b.cx(r[i], u[i]);
-        }
-        // Reversed (D): add tmp to v_w. Truncated to uv_width (late iter bound).
-        let add_width = transform_width;
-        let tmp_add_slice: Vec<QubitId> = tmp[0..add_width].to_vec();
-        let v_w_slice: Vec<QubitId> = v_w[0..add_width].to_vec();
-        if std::env::var("KAL_VENT_MODADD").ok().as_deref() == Some("1") {
-            add_nbit_qq(b, &tmp_add_slice, &v_w_slice);
-        } else {
-            add_nbit_qq_fast(b, &tmp_add_slice, &v_w_slice);
-        }
-        // Unload: bits < min(load_width, transform_width) both apply (tmp = add_f AND u after transform).
-        // For bits where transform was applied, tmp = add_f AND u. For bits where transform skipped
-        // (i >= transform_width), tmp stays at whatever load left it (either add_f AND r or 0).
-        for i in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(tmp[i], m);
-            if i < transform_width {
-                // Transform applied: tmp = add_f AND u.
-                b.cz_if(add_f, u[i], m);
-            } else if i < load_width {
-                // Load done but transform skipped: tmp = add_f AND r.
-                b.cz_if(add_f, r[i], m);
-            }
-            // else: tmp = 0, no phase.
-        }
-        b.free_vec(&owned_tmp);
+        let n = u.len();
+        let dw = if iter_idx < n { n } else { 2*n-iter_idx };
+        let cw = (iter_idx+2).min(n);
+        controlled_sub_linear_workspace(b, &r[..cw], &s[..cw], add_f);
+        controlled_add_linear_workspace(b, &u[..dw], &v_w[..dw], add_f);
     }
     // Reversed (A): measurement-uncompute add_f = f AND (NOT b_f)
     b.x(b_f);

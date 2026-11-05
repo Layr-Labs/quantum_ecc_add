@@ -221,3 +221,86 @@ fn apply_clean<R: XofReader>(sim: &mut Simulator<'_, R>, ops: &[Op]) {
         sim.apply_iter(std::iter::once(op));
     }
 }
+
+#[test]
+fn exhaustive_measured_controlled_add() {
+    for n in 1..=5 {
+        for subtract in [false,true] {
+            let mut b=B::new();
+            let ctrl=b.alloc_qubit();
+            let a=b.alloc_qubits(n);
+            let acc=b.alloc_qubits(n);
+            if subtract {controlled_sub_linear_workspace(&mut b,&a,&acc,ctrl);}
+            else {controlled_add_linear_workspace(&mut b,&a,&acc,ctrl);}
+            let ar:Vec<_>=a.iter().copied().map(QubitOrBit::Qubit).collect();
+            let rr:Vec<_>=acc.iter().copied().map(QubitOrBit::Qubit).collect();
+            let mut xof=Shake256::default().finalize_xof();
+            let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+            let cases=1usize<<(2*n+1);
+            for first in (0..cases).step_by(64) {
+                sim.clear_for_shot();
+                let lanes=64.min(cases-first);
+                for lane in 0..lanes {
+                    let case=first+lane;
+                    sim.qubits[ctrl.0 as usize]|=((case&1) as u64)<<lane;
+                    sim.set_register(&ar,U256::from((case>>1)&((1usize<<n)-1)),lane);
+                    sim.set_register(&rr,U256::from((case>>(n+1))&((1usize<<n)-1)),lane);
+                }
+                apply_clean(&mut sim,&b.ops);
+                assert_eq!(sim.phase,0);
+                for lane in 0..lanes {
+                    let case=first+lane;
+                    let av=((case>>1)&((1usize<<n)-1)) as u64;
+                    let rv=((case>>(n+1))&((1usize<<n)-1)) as u64;
+                    let addend=if case&1==1 {av} else {0};
+                    let expected=if subtract {rv.wrapping_sub(addend)} else {rv+addend} & ((1u64<<n)-1);
+                    assert_eq!(sim.get_register(&rr,lane),U256::from(expected),"n={n} case={case} sub={subtract}");
+                    assert_eq!(sim.get_register(&ar,lane),U256::from(av));
+                    assert_eq!((sim.qubit(ctrl)>>lane)&1,(case&1) as u64);
+                }
+            }
+            assert!(b.next_qubit as usize <= 3*n);
+        }
+    }
+}
+
+#[test]
+fn large_measured_controlled_add() {
+    let mut seed=Shake256::default();
+    seed.update(b"measurement controlled ladder independent large tests");
+    let mut input=seed.finalize_xof();
+    for n in [8usize,32,128,256] {
+        for subtract in [false,true] {
+            let mut b=B::new();
+            let ctrl=b.alloc_qubit();
+            let a=b.alloc_qubits(n);
+            let acc=b.alloc_qubits(n);
+            if subtract {controlled_sub_linear_workspace(&mut b,&a,&acc,ctrl);}
+            else {controlled_add_linear_workspace(&mut b,&a,&acc,ctrl);}
+            let ar:Vec<_>=a.iter().copied().map(QubitOrBit::Qubit).collect();
+            let rr:Vec<_>=acc.iter().copied().map(QubitOrBit::Qubit).collect();
+            let mut xof=Shake256::default().finalize_xof();
+            let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+            let mask=if n==256 {U256::MAX} else {(U256::from(1u64)<<n)-U256::from(1u64)};
+            for _ in 0..32 {
+                sim.clear_for_shot();
+                for &q in a.iter().chain(acc.iter()).chain(std::iter::once(&ctrl)) {
+                    let mut bytes=[0u8;8]; input.read(&mut bytes);
+                    sim.qubits[q.0 as usize]=u64::from_le_bytes(bytes);
+                }
+                let cv=sim.qubit(ctrl);
+                let before:Vec<_>=(0..64).map(|lane|(sim.get_register(&ar,lane),sim.get_register(&rr,lane))).collect();
+                apply_clean(&mut sim,&b.ops);
+                assert_eq!(sim.phase,0);
+                assert_eq!(sim.qubit(ctrl),cv);
+                for lane in 0..64 {
+                    let (av,rv)=before[lane];
+                    let addend=if (cv>>lane)&1==1 {av} else {U256::ZERO};
+                    let expected=if subtract {rv.wrapping_sub(addend)} else {rv.wrapping_add(addend)} & mask;
+                    assert_eq!(sim.get_register(&rr,lane),expected);
+                    assert_eq!(sim.get_register(&ar,lane),av);
+                }
+            }
+        }
+    }
+}
