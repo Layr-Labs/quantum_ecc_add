@@ -537,7 +537,9 @@ fn exhaustive_constant_one_carry() {
 #[test]
 fn exhaustive_biased_controlled_kernel() {
     for n in 1..=5 {
+      for room in 0..=n {
         let mut b=B::new();let ctrl=b.alloc_qubit();let x=b.alloc_qubits(n);let acc=b.alloc_qubits(n+1);
+        let _context=b.alloc_qubits(WORKSPACE_SOFT_LIMIT - b.active_qubits as usize - room);
         controlled_add_subtract_fast(&mut b,&x,&acc,ctrl);let boundary=b.ops.len();controlled_add_subtract_fast_inverse(&mut b,&x,&acc,ctrl);
         let xr:Vec<_>=x.iter().copied().map(QubitOrBit::Qubit).collect();let rr:Vec<_>=acc.iter().copied().map(QubitOrBit::Qubit).collect();
         let mut xof=Shake256::default().finalize_xof();let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
@@ -550,6 +552,7 @@ fn exhaustive_biased_controlled_kernel() {
             apply_clean(&mut sim,&b.ops[boundary..]);assert_eq!(sim.phase,0);
             for lane in 0..lanes {let case=first+lane;assert_eq!(sim.get_register(&rr,lane),U256::from((case>>(n+1))&mask as usize));assert_eq!(sim.get_register(&xr,lane),U256::from((case>>1)&((1<<n)-1)));assert_eq!((sim.qubit(ctrl)>>lane)&1,(case&1) as u64);}
         }
+      }
     }
 }
 
