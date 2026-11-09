@@ -94,3 +94,13 @@ phase, inverse XOR-copy and strict reset checks. Nineteen tests pass.
 Full 9,024-shot validation passes at 3,824,279 Toffolis, 2,333 qubits,
 product 8,922,042,907, zero coordinate/phase/ancilla failures. Next: modular
 add/subtract callbacks at the other reduction sites with more spare width.
+
+First product-fold submission promoted as 5445379f-9413-4ad5-ae44-5f889e8a8446,
+source 7ca6b1fcefc84601b6685cbea809381e82443dc6; normal sync completed.
+Affine follow-up uses the same fold for breg's fresh zero-output copy and
+its two modular-subtraction reduction sites. Tests now check XOR/add/subtract
+callbacks with arbitrary initial accumulators and inverse callbacks at four
+occupancies. All 19 tests pass. Full 9,024 shots pass at 3,793,329 Toffolis,
+2,333 qubits, score 8,849,836,557, zero coordinate/phase/ancilla failures.
+Using a modular add into fresh breg costs1,023 more Toffolis than its CNOT
+copy; the final integration uses the documented initially zero register.

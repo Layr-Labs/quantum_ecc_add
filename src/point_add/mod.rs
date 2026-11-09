@@ -3655,31 +3655,10 @@ fn mod_add_solinas_ext_product(b: &mut B, acc: &[QubitId], tmp_ext: &[QubitId], 
 }
 
 fn mod_sub_solinas_ext_product(b: &mut B, acc: &[QubitId], tmp_ext: &[QubitId], p: U256) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    debug_assert_eq!(tmp_ext.len(), 2 * n);
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2 * n].to_vec();
-    mod_sub_qq_fast(b, acc, &lo, p);
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_sub_qq(b, acc, &hi, p);
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
-    for _ in 0..10 {
-        mod_halve_inplace_fast(b, &hi, p);
-    }
+    assert_eq!(acc.len(),256);
+    product_fold::with_reduced(b,tmp_ext,p,|b,reduced| {
+        mod_sub_qq_fast(b,acc,reduced,p);
+    });
 }
 
 fn square_tx_and_combined_ty_l2minus3qx(
@@ -3704,7 +3683,9 @@ fn square_tx_and_combined_ty_l2minus3qx(
 
     b.set_phase("affine_combined_breg_red");
     let breg = b.alloc_qubits(n);
-    mod_add_solinas_ext_product(b, &breg, &tmp_ext, p);
+    product_fold::with_reduced(b,&tmp_ext,p,|b,reduced| {
+        for i in 0..n {b.cx(reduced[i],breg[i]);}
+    });
     mod_sub_qb(b, &breg, &ox3, p);
 
     b.set_phase("affine_combined_y_mul");

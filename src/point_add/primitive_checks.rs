@@ -714,15 +714,17 @@ fn full_width_product_fold() {
     let mut seed=Shake256::default();seed.update(b"independent two-fold reduction vectors");
     let mut input=seed.finalize_xof();
     for context in [0usize,1400,1435,1500] {
+      for mode in 0..3 {
         let mut b=B::new();let _context=b.alloc_qubits(context);
         let word=b.alloc_qubits(512);let out=b.alloc_qubits(256);
-        product_fold::with_reduced(&mut b,&word,p,|b,result| {
-            for i in 0..256 {b.cx(result[i],out[i]);}
-        });
-        let split=b.ops.len();
-        product_fold::with_reduced(&mut b,&word,p,|b,result| {
-            for i in 0..256 {b.cx(result[i],out[i]);}
-        });
+        let emit=|b: &mut B,inverse: bool| {
+            product_fold::with_reduced(b,&word,p,|b,result| {
+                if mode==0 {for i in 0..256 {b.cx(result[i],out[i]);}}
+                else if (mode==1)^inverse {mod_add_qq_fast(b,&out,result,p);}
+                else {mod_sub_qq_fast(b,&out,result,p);}
+            });
+        };
+        emit(&mut b,false);let split=b.ops.len();emit(&mut b,true);
         let lr:Vec<_>=word[..256].iter().copied().map(QubitOrBit::Qubit).collect();
         let hr:Vec<_>=word[256..].iter().copied().map(QubitOrBit::Qubit).collect();
         let rr:Vec<_>=out.iter().copied().map(QubitOrBit::Qubit).collect();
@@ -731,17 +733,20 @@ fn full_width_product_fold() {
         for _ in 0..8 {
             sim.clear_for_shot();let mut before=Vec::new();
             for lane in 0..64 {
-                let mut bytes=[0u8;64];input.read(&mut bytes);
+                let mut bytes=[0u8;96];input.read(&mut bytes);
                 let lo=match lane {0=>U256::ZERO,1=>U256::MAX,2=>p,3=>p-U256::from(1u64),4=>p+U256::from(1u64),5=>U256::MAX,6=>p,7=>U256::ZERO,_=>U256::from_le_slice(&bytes[..32])};
-                let hi=match lane {0=>U256::ZERO,1=>U256::MAX,2=>p,3=>U256::ZERO,4=>U256::from(1u64),5=>U256::ZERO,6=>U256::ZERO,7=>U256::from(1u64),_=>U256::from_le_slice(&bytes[32..])};
-                before.push((lo,hi));sim.set_register(&lr,lo,lane);sim.set_register(&hr,hi,lane);
+                let hi=match lane {0=>U256::ZERO,1=>U256::MAX,2=>p,3=>U256::ZERO,4=>U256::from(1u64),5=>U256::ZERO,6=>U256::ZERO,7=>U256::from(1u64),_=>U256::from_le_slice(&bytes[32..64])};
+                let rv=match lane%8 {0=>U256::ZERO,1=>p-U256::from(1u64),_=>U256::from_le_slice(&bytes[64..])%p};
+                before.push((lo,hi,rv));sim.set_register(&lr,lo,lane);sim.set_register(&hr,hi,lane);sim.set_register(&rr,rv,lane);
             }
-            for (ops,erased) in [(&b.ops[..split],false),(&b.ops[split..],true)] {
+            for (ops,restored) in [(&b.ops[..split],false),(&b.ops[split..],true)] {
                 apply_clean(&mut sim,ops);assert_eq!(sim.phase,0);
                 for lane in 0..64 {
-                    let (lo,hi)=before[lane];
-                    let expected=if erased {U256::ZERO}else{(lo%p).add_mod(hi.mul_mod(c,p),p)};
-                    assert_eq!(sim.get_register(&rr,lane),expected,"fold context={context} lane={lane} erased={erased}");
+                    let (lo,hi,rv)=before[lane];let residue=(lo%p).add_mod(hi.mul_mod(c,p),p);
+                    let expected=if restored {rv}else if mode==0 {rv^residue}
+                        else if mode==1 {rv.add_mod(residue,p)}
+                        else if rv>=residue {rv-residue}else {p-(residue-rv)};
+                    assert_eq!(sim.get_register(&rr,lane),expected,"fold context={context} mode={mode} lane={lane} restored={restored}");
                     assert_eq!(sim.get_register(&lr,lane),lo);assert_eq!(sim.get_register(&hr,lane),hi);
                 }
                 for q in 0..b.next_qubit {
@@ -749,5 +754,6 @@ fn full_width_product_fold() {
                 }
             }
         }
+      }
     }
 }
