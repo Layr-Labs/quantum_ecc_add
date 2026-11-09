@@ -104,3 +104,14 @@ occupancies. All 19 tests pass. Full 9,024 shots pass at 3,793,329 Toffolis,
 2,333 qubits, score 8,849,836,557, zero coordinate/phase/ancilla failures.
 Using a modular add into fresh breg costs1,023 more Toffolis than its CNOT
 copy; the final integration uses the documented initially zero register.
+
+Affine fold promoted as 678916fd-86a4-4883-adae-a0d42cd29c3b, source
+d6e7552e404a74421272e40369d91f7aa08bfe9b; normal sync completed.
+Accumulating schoolbook and regular/lowq Karatsuba helpers now share the
+additive fold callback via mod_add_solinas_ext_product, removing repeated
+inline scaling schedules. All19 primitive tests and9,024 fullshots pass at
+3,772,038 Toffolis, 2,333 qubits, score8,800,164,654, zero coordinate/phase/
+ancilla failures. Fold and raw multiply kernels unchanged. Next: short_term
+can avoid padding when a one-bit-short addend already matches the generic
+interface, or use segmented zero-extension when padding+carry-in exceeds
+room. Current first-fold reduction peak2333 appears one above budget2332.

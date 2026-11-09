@@ -3082,28 +3082,7 @@ fn mod_mul_add_into_acc_karatsuba_lowq_with_tmp_ext(
     let z1_reg = b.alloc_qubits(2 * (h + 1));
     karatsuba_forward_lowq(b, x, y, tmp_ext, &z1_reg);
 
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2 * n].to_vec();
-    mod_add_qq_fast(b, acc, &lo, p);
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_add_qq_fast(b, acc, &hi, p);
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_add_qq_fast(b, acc, &hi, p);
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
-    for _ in 0..10 {
-        mod_halve_inplace_fast(b, &hi, p);
-    }
+    mod_add_solinas_ext_product(b,acc,tmp_ext,p);
 
     karatsuba_inverse_lowq(b, x, y, tmp_ext, &z1_reg);
     b.free_vec(&z1_reg);
@@ -3182,28 +3161,7 @@ fn mod_mul_add_into_acc_karatsuba_with_tmp_ext(
     let z1_reg = b.alloc_qubits(2 * (h + 1));
     karatsuba_forward(b, x, y, tmp_ext, &z1_reg);
 
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2 * n].to_vec();
-    mod_add_qq_fast(b, acc, &lo, p);
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_add_qq_fast(b, acc, &hi, p);
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_add_qq_fast(b, acc, &hi, p);
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
-    for _ in 0..10 {
-        mod_halve_inplace_fast(b, &hi, p);
-    }
+    mod_add_solinas_ext_product(b,acc,tmp_ext,p);
 
     karatsuba_inverse(b, x, y, tmp_ext, &z1_reg);
     b.free_vec(&z1_reg);
@@ -3484,37 +3442,11 @@ fn mod_mul_add_into_acc_schoolbook(
 ) {
     let n = acc.len();
     debug_assert_eq!(n, 256);
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
 
     let tmp_ext = b.alloc_qubits(2 * n);
     schoolbook_mul_into_addsub(b, x, y, &tmp_ext);
 
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2 * n].to_vec();
-    let _ = c;
-    mod_add_qq_fast(b, acc, &lo, p);
-    // Solinas with 977 = 2^10 - 2^6 + 2^4 + 2^0. c = 2^32 + 977 = {+2^0, +2^4, -2^6, +2^10, +2^32}.
-    // 5 ops instead of 7 (saves 2 per call). Use shift_left_by_22 for the 10→32 gap.
-    mod_add_qq_fast(b, acc, &hi, p); // position 0
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_add_qq_fast(b, acc, &hi, p); // position 4
-    for _ in 0..2 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_sub_qq_fast(b, acc, &hi, p); // position 6 (SUB because of 977 consolidation)
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_add_qq_fast(b, acc, &hi, p); // position 10
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_add_qq_fast(b, acc, &hi, p); // position 32
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
-    b.set_phase("sol_halve_tail");
-    for _ in 0..10 {
-        mod_halve_inplace_fast(b, &hi, p);
-    }
+    mod_add_solinas_ext_product(b,acc,&tmp_ext,p);
 
     b.set_phase("schoolbook_mul_inverse");
     schoolbook_mul_into_addsub_inverse(b, x, y, &tmp_ext);
@@ -3627,31 +3559,10 @@ fn squaring_add_to_acc_schoolbook(b: &mut B, acc: &[QubitId], x: &[QubitId], p: 
 }
 
 fn mod_add_solinas_ext_product(b: &mut B, acc: &[QubitId], tmp_ext: &[QubitId], p: U256) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    debug_assert_eq!(tmp_ext.len(), 2 * n);
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2 * n].to_vec();
-    mod_add_qq_fast(b, acc, &lo, p);
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    mod_add_qq_fast(b, acc, &hi, p);
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_add_qq_fast(b, acc, &hi, p);
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
-    for _ in 0..10 {
-        mod_halve_inplace_fast(b, &hi, p);
-    }
+    assert_eq!(acc.len(),256);
+    product_fold::with_reduced(b,tmp_ext,p,|b,reduced| {
+        mod_add_qq_fast(b,acc,reduced,p);
+    });
 }
 
 fn mod_sub_solinas_ext_product(b: &mut B, acc: &[QubitId], tmp_ext: &[QubitId], p: U256) {
