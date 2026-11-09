@@ -361,11 +361,12 @@ fn large_sparse_controlled_constants() {
     let mut input=seed.finalize_xof();
     for n in [8usize,32,128,256] {
         let mask=if n==256 {U256::MAX} else {(U256::from(1u64)<<n)-U256::from(1u64)};
+        for room in [n+2,n-2,n/2+2,n/2-2,8] {
         for c in [U256::from(1u64),U256::from(3u64),U256::from(5u64),U256::from(977u64),U256::from(0x1000003d1u64)] {
             let c=c & mask;
             for subtract in [false,true] {
                 let mut b=B::new();
-                let _occupied=b.alloc_qubits(2200);
+                let _occupied=b.alloc_qubits(WORKSPACE_SOFT_LIMIT-n-1-room);
                 let ctrl=b.alloc_qubit();let acc=b.alloc_qubits(n);
                 if subtract {csub_nbit_const_direct_fast(&mut b,&acc,c,ctrl);}
                 else {cadd_nbit_const_direct_fast(&mut b,&acc,c,ctrl);}
@@ -390,6 +391,7 @@ fn large_sparse_controlled_constants() {
                     }
                 }
             }
+        }
         }
     }
 }
@@ -694,4 +696,14 @@ fn exhaustive_partial_carry_comparator() {
             }
         }
     }
+}
+
+#[test]
+#[ignore]
+fn full_circuit_construction_accounting() {
+    let ops=build();
+    let toff=ops.iter().filter(|o| matches!(o.kind,OperationType::CCX|OperationType::CCZ)).count();
+    let conditional=ops.iter().filter(|o| matches!(o.kind,OperationType::CCX|OperationType::CCZ) && o.c_condition!=crate::circuit::NO_BIT).count();
+    let (qubits,_,_,_)=analyze_ops(ops.iter());
+    eprintln!("CONSTRUCTION toff={toff} qubits={qubits} product={} conditional_toff={conditional}",toff as u64*qubits);
 }

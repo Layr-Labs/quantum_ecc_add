@@ -54,3 +54,19 @@ only later steps can target u[i] directly. With no room, keep the old pure
 unitary comparator. Exhaustive tests check every capacity and both initial
 flag values at widths 1..6, input preservation, predicate XOR, double-call
 identity, zero phase, zero workspace and strict pre-reset checks.
+
+The partial comparator promoted as 5ff96417-3814-4097-8f89-7965d1c65f2e,
+source 81c9fe8c7f19869f8af0bbf4d1e38a9402048b98; normal sync completed.
+Removing the scoped comparator's copied carry input passes exhaustive tests
+but changes neither Toffolis nor peak. That source experiment is cached,
+not retained in the scoring candidate.
+
+Budget 2331 alone predicts 3,843,131 Toffolis, product 8,958,338,361.
+Blocked controlled increment/decrement can split off only enough low bits to
+let the high suffix fit a full ripple: with room=L-active, require split>=n-room.
+Cap by the existing available-prefix allowance and half-width progress bound.
+This avoids unnecessary low-block overflow cleanup. Combined with budget2331,
+18 primitive tests and all 9,024 full shots pass at 3,840,467 Toffolis,
+2,331 qubits, product 8,952,128,577; zero coordinate/phase/ancilla failures.
+The sparse controlled-constant test now varies room around full, half and
+tight capacities, including cases that actually select the changed split.

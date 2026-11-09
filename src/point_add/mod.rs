@@ -390,7 +390,7 @@ pub const N: usize = 256;
 
 // Choose lower-workspace arithmetic only where a fast temporary would exceed
 // this geometry budget. This does not depend on arithmetic input values.
-const WORKSPACE_SOFT_LIMIT: usize = 2333;
+const WORKSPACE_SOFT_LIMIT: usize = 2331;
 
 /// secp256k1 prime:  p = 2^256 - 2^32 - 977.
 pub const SECP256K1_P: U256 = U256::from_limbs([
@@ -1320,9 +1320,11 @@ fn csub_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
     let n = acc.len();
     if c == U256::from(1u64) && n >= 16
         && b.active_qubits as usize + n-1 > WORKSPACE_SOFT_LIMIT {
-        let available = WORKSPACE_SOFT_LIMIT
-            .saturating_sub(b.active_qubits as usize + 3).max(2);
-        let split = available.min(n/2).max(2);
+        let room = WORKSPACE_SOFT_LIMIT.saturating_sub(b.active_qubits as usize);
+        let available = room.saturating_sub(3).max(2);
+        // Leave the largest possible final suffix for a single full ripple.
+        // Its carry array has suffix_len-1 wires, plus our overflow wire.
+        let split = n.saturating_sub(room).max(2).min(available).min(n/2).max(2);
         let overflow = b.alloc_qubit();
         let mut low = acc[..split].to_vec(); low.push(overflow);
         csub_nbit_const_direct_fast_core(b, &low, c, ctrl);
@@ -1445,9 +1447,11 @@ fn cadd_nbit_const_direct_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitI
     let n = acc.len();
     if c == U256::from(1u64) && n >= 16
         && b.active_qubits as usize + n-1 > WORKSPACE_SOFT_LIMIT {
-        let available = WORKSPACE_SOFT_LIMIT
-            .saturating_sub(b.active_qubits as usize + 3).max(2);
-        let split = available.min(n/2).max(2);
+        let room = WORKSPACE_SOFT_LIMIT.saturating_sub(b.active_qubits as usize);
+        let available = room.saturating_sub(3).max(2);
+        // Leave the largest possible final suffix for a single full ripple.
+        // Its carry array has suffix_len-1 wires, plus our overflow wire.
+        let split = n.saturating_sub(room).max(2).min(available).min(n/2).max(2);
         let overflow = b.alloc_qubit();
         let mut low = acc[..split].to_vec(); low.push(overflow);
         cadd_nbit_const_direct_fast_core(b, &low, c, ctrl);
