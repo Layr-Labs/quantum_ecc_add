@@ -21,14 +21,14 @@ fn multiply_odd(b: &mut B, q: &[QubitId], c: U256, inverse: bool) {
         }
     }
 }
-fn short_term(b: &mut B, q: &[QubitId], target: &[QubitId], subtract: bool) {
+pub(super) fn short_term(b: &mut B, q: &[QubitId], target: &[QubitId], subtract: bool) {
     assert!(target.len()>=q.len());
     let padding=b.alloc_qubits(target.len()-q.len());
     let mut input=q.to_vec();input.extend_from_slice(&padding);
     if subtract {sub_nbit_qq_fast(b,&input,target);}else{add_nbit_qq_fast(b,&input,target);}
     b.free_vec(&padding);
 }
-fn solinas_product(b: &mut B, q: &[QubitId], product: &[QubitId], inverse: bool) {
+pub(super) fn solinas_product(b: &mut B, q: &[QubitId], product: &[QubitId], inverse: bool) {
     // c = 1 + 2^4 - 2^6 + 2^10 + 2^32. Products fit k+33 bits.
     let terms=[(4usize,false),(6,true),(10,false),(32,false)];
     if !inverse {

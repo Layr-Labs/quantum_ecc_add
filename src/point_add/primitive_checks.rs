@@ -707,3 +707,47 @@ fn full_circuit_construction_accounting() {
     let (qubits,_,_,_)=analyze_ops(ops.iter());
     eprintln!("CONSTRUCTION toff={toff} qubits={qubits} product={} conditional_toff={conditional}",toff as u64*qubits);
 }
+
+#[test]
+fn full_width_product_fold() {
+    let p=SECP256K1_P;let c=U256::from(0x1000003d1u64);
+    let mut seed=Shake256::default();seed.update(b"independent two-fold reduction vectors");
+    let mut input=seed.finalize_xof();
+    for context in [0usize,1400,1435,1500] {
+        let mut b=B::new();let _context=b.alloc_qubits(context);
+        let word=b.alloc_qubits(512);let out=b.alloc_qubits(256);
+        product_fold::with_reduced(&mut b,&word,p,|b,result| {
+            for i in 0..256 {b.cx(result[i],out[i]);}
+        });
+        let split=b.ops.len();
+        product_fold::with_reduced(&mut b,&word,p,|b,result| {
+            for i in 0..256 {b.cx(result[i],out[i]);}
+        });
+        let lr:Vec<_>=word[..256].iter().copied().map(QubitOrBit::Qubit).collect();
+        let hr:Vec<_>=word[256..].iter().copied().map(QubitOrBit::Qubit).collect();
+        let rr:Vec<_>=out.iter().copied().map(QubitOrBit::Qubit).collect();
+        let mut xof=Shake256::default().finalize_xof();
+        let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+        for _ in 0..8 {
+            sim.clear_for_shot();let mut before=Vec::new();
+            for lane in 0..64 {
+                let mut bytes=[0u8;64];input.read(&mut bytes);
+                let lo=match lane {0=>U256::ZERO,1=>U256::MAX,2=>p,3=>p-U256::from(1u64),4=>p+U256::from(1u64),5=>U256::MAX,6=>p,7=>U256::ZERO,_=>U256::from_le_slice(&bytes[..32])};
+                let hi=match lane {0=>U256::ZERO,1=>U256::MAX,2=>p,3=>U256::ZERO,4=>U256::from(1u64),5=>U256::ZERO,6=>U256::ZERO,7=>U256::from(1u64),_=>U256::from_le_slice(&bytes[32..])};
+                before.push((lo,hi));sim.set_register(&lr,lo,lane);sim.set_register(&hr,hi,lane);
+            }
+            for (ops,erased) in [(&b.ops[..split],false),(&b.ops[split..],true)] {
+                apply_clean(&mut sim,ops);assert_eq!(sim.phase,0);
+                for lane in 0..64 {
+                    let (lo,hi)=before[lane];
+                    let expected=if erased {U256::ZERO}else{(lo%p).add_mod(hi.mul_mod(c,p),p)};
+                    assert_eq!(sim.get_register(&rr,lane),expected,"fold context={context} lane={lane} erased={erased}");
+                    assert_eq!(sim.get_register(&lr,lane),lo);assert_eq!(sim.get_register(&hr,lane),hi);
+                }
+                for q in 0..b.next_qubit {
+                    if !word.contains(&QubitId(q)) && !out.contains(&QubitId(q)) {assert_eq!(sim.qubits[q as usize],0);}
+                }
+            }
+        }
+    }
+}

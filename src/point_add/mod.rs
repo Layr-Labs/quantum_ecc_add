@@ -71,6 +71,7 @@ use crate::weierstrass_elliptic_curve::WeierstrassEllipticCurve;
 
 mod classical_offset;
 mod clean_scale;
+mod product_fold;
 mod fermat_inv;
 mod venting;
 
@@ -3236,40 +3237,9 @@ fn mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(
     b.set_phase("kara_fwd");
     karatsuba_forward(b, x, y, tmp_ext, &z1_reg);
     b.set_phase("kara_solinas");
-
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2 * n].to_vec();
-    b.set_phase("sol_addlo");
-    mod_add_qq_fast_from_zero(b, acc, &lo, p);
-    b.set_phase("sol_add0");
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    b.set_phase("sol_add4");
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    b.set_phase("sol_sub6");
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 {
-        mod_double_inplace_fast(b, &hi, p);
-    }
-    b.set_phase("sol_add10");
-    mod_add_qq_fast(b, acc, &hi, p);
-    b.set_phase("kara_solinas_shift22L");
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    b.set_phase("kara_solinas_post32_add");
-    // Direct constant arithmetic makes the fast modular helper lower-width
-    // here as well; the old non-fast choice retained a loaded constant register.
-    mod_add_qq_fast(b, acc, &hi, p);
-    b.set_phase("kara_solinas_shift22R");
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
-    b.set_phase("kara_solinas_post_halve");
-    for _ in 0..10 {
-        mod_halve_inplace_fast(b, &hi, p);
-    }
+    product_fold::with_reduced(b,tmp_ext,p,|b,reduced| {
+        for i in 0..n {b.cx(reduced[i],acc[i]);}
+    });
 
     b.set_phase("kara_inv");
     karatsuba_inverse(b, x, y, tmp_ext, &z1_reg);

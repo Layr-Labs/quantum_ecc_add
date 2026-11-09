@@ -78,3 +78,19 @@ The 2332 follow-up passes 9,024 shots at 3,838,706 Toffolis, 2,332 qubits,
 product 8,951,862,392. It saves 1,761 Toffolis for one added qubit.
 The proposed always-first-measured comparator fallback passes tests but
 has no full-circuit resource effect here; excluded and cached separately.
+
+Budget2332 promoted as 0d431d02-3ccd-484d-a989-5cf48bf72fb6, source
+094d5af84ac3deb49a91aa0d8f8246cc95e2e91d, and normal sync completed.
+Small clean shifts 2/4 are gate-expensive; larger shifts can lower gates but
+add too much width at the first product reduction (2,203 live qubits).
+New product_fold.rs instead folds raw 512-bit words twice with c=2^32+977.
+First T=L+cH fits289 bits, q=T>>256<=c. Then S=T_low+cq<2p. Retain q33 and
+the reduction bit across a callback, explicitly undo reduction and both folds.
+It reuses clean_scale short_term and solinas_product, with compact66-bit cq.
+At the first known-zero output multiplication, copy the canonical residue
+then uncompute the fold and raw Karatsuba product. Independent arbitrary-limb
+boundary/random tests at four occupancies pass, with exact raw-word restore,
+phase, inverse XOR-copy and strict reset checks. Nineteen tests pass.
+Full 9,024-shot validation passes at 3,824,279 Toffolis, 2,333 qubits,
+product 8,922,042,907, zero coordinate/phase/ancilla failures. Next: modular
+add/subtract callbacks at the other reduction sites with more spare width.
