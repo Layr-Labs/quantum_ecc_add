@@ -23,7 +23,20 @@ fn multiply_odd(b: &mut B, q: &[QubitId], c: U256, inverse: bool) {
 }
 pub(super) fn short_term(b: &mut B, q: &[QubitId], target: &[QubitId], subtract: bool) {
     assert!(target.len()>=q.len());
-    let padding=b.alloc_qubits(target.len()-q.len());
+    let extra=target.len()-q.len();
+    // The generic adder already supports an implicit zero top input.
+    if extra<=1 {
+        if subtract {sub_nbit_qq_fast(b,q,target);}else{add_nbit_qq_fast(b,q,target);}
+        return;
+    }
+    // Avoid allocating padding that leaves no room for the carry input.
+    // These sparse-product terms have a short extension and can instead
+    // propagate their low carry with the established segmented helper.
+    if b.active_qubits as usize + extra + 1 > WORKSPACE_SOFT_LIMIT {
+        if subtract {sub_zero_extended(b,q,target);}else{add_zero_extended(b,q,target);}
+        return;
+    }
+    let padding=b.alloc_qubits(extra);
     let mut input=q.to_vec();input.extend_from_slice(&padding);
     if subtract {sub_nbit_qq_fast(b,&input,target);}else{add_nbit_qq_fast(b,&input,target);}
     b.free_vec(&padding);

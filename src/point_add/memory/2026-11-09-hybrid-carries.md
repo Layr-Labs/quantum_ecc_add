@@ -115,3 +115,13 @@ ancilla failures. Fold and raw multiply kernels unchanged. Next: short_term
 can avoid padding when a one-bit-short addend already matches the generic
 interface, or use segmented zero-extension when padding+carry-in exceeds
 room. Current first-fold reduction peak2333 appears one above budget2332.
+
+Accumulator-fold submission promoted as 31640a10-bdc2-4f0a-85f6-fcd88a1c169d,
+source945359f55ccd8cf4145cf0aadfbd66c28b70abde; normal sync completed.
+short_term now uses implicit topzero for equal/one-bit-short input and
+segmented zero-extension if padding+carry-input would exceed the budget.
+19 tests and9,024 fullshots pass at3,772,023 Toffolis,2332 qubits,
+score8,796,357,636; zero coordinate/phase/ancilla failures. Peak moved back
+to kara_fwd. A fresh budget scan2316..2340 still selects2332 among tested
+values;2330 is close at8,796,493,270 but worse. Temporary scan overrides
+are excluded by restoring the exact measured production source.
