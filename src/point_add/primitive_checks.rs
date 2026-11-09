@@ -71,17 +71,24 @@ fn large_direct_arithmetic_and_phase() {
     let mut input = seed.finalize_xof();
     for n in [8usize, 32, 255, 256] {
         let mask = if n == 256 { U256::MAX } else { (U256::from(1u64) << n) - U256::from(1u64) };
-        for mode in 0..7 {
+        for mode in 0..11 {
             let mut b = B::new();
-            let aw = if mode == 1 || mode == 3 { n-1 } else { n };
-            let a = if mode < 4 { b.alloc_qubits(aw) } else { Vec::new() };
+            let aw = if mode == 1 || mode == 3 || mode == 8 || mode == 10 { n-1 } else { n };
+            let a = if mode < 4 || mode >= 7 { b.alloc_qubits(aw) } else { Vec::new() };
             let acc = b.alloc_qubits(n);
             let constant = match mode {
                 4 => U256::from(0x1000003d1u64),
                 5 => SECP256K1_P.wrapping_add(U256::from(1u64)),
                 _ => U256::MAX,
             } & mask;
-            if mode < 2 { cuccaro_add_fast_zero(&mut b, &a, &acc); }
+            if mode >= 7 {
+                // Force a partial measured carry register in the wrapper.
+                let room=n/2;
+                let _context=b.alloc_qubits(WORKSPACE_SOFT_LIMIT - b.active_qubits as usize - room);
+                if mode < 9 { add_nbit_qq_fast(&mut b, &a, &acc); }
+                else { sub_nbit_qq_fast(&mut b, &a, &acc); }
+            }
+            else if mode < 2 { cuccaro_add_fast_zero(&mut b, &a, &acc); }
             else if mode < 4 { cuccaro_sub_fast_zero(&mut b, &a, &acc); }
             else { add_nbit_const_direct(&mut b, &acc, constant); }
             let ar: Vec<_> = a.iter().copied().map(QubitOrBit::Qubit).collect();
@@ -105,8 +112,8 @@ fn large_direct_arithmetic_and_phase() {
                 assert_eq!(sim.phase,0,"large phase n={n} mode={mode}");
                 for lane in 0..64 {
                     let (av,rv) = before[lane];
-                    let addend = if mode<4 { av } else { constant };
-                    let expected = if mode==2 || mode==3 { rv.wrapping_sub(addend) } else { rv.wrapping_add(addend) } & mask;
+                    let addend = if mode<4 || mode>=7 { av } else { constant };
+                    let expected = if mode==2 || mode==3 || mode>=9 { rv.wrapping_sub(addend) } else { rv.wrapping_add(addend) } & mask;
                     assert_eq!(sim.get_register(&rr,lane),expected,"large arithmetic n={n} mode={mode}");
                     assert_eq!(sim.get_register(&ar,lane),av);
                 }

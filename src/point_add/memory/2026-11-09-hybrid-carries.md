@@ -35,3 +35,12 @@ carry-storage improvement does not resolve that inherited limitation.
 Full local validation passed all 9,024 shots at the predicted 8,974,568,069,
 with zero coordinate, phase or ancilla failures. Average executed Cliffords
 are 20,245,223.775; emitted operations 28,134,869, classical bits 1,868,860.
+
+The first hybrid candidate promoted as 92758ece-6022-4b20-a851-22673be9a355,
+source 0cf07bf8945264dad21dcaba1c549277a76eee10. Normal frontier sync completed.
+The ordinary add/sub wrapper follow-up passes 9,024 shots at 3,842,901
+Toffolis, 2,333 qubits, product 8,965,488,033. It prepares a zero carry-in
+and calls the hybrid pair instead of the all-unitary fallback; short addends
+need no physical top padding. The seventeen-test suite passes with added
+high-occupancy equal-width/short-addend coverage through 256 bits. A geometry
+scan over 2240..2340 still selects 2333 among tested values.

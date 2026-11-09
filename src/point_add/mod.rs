@@ -1190,13 +1190,9 @@ fn cuccaro_sub_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
 fn add_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     assert!(a.len() == acc.len() || a.len() + 1 == acc.len());
     if b.active_qubits as usize + acc.len().saturating_sub(1) > WORKSPACE_SOFT_LIMIT {
-        let pad = if a.len() < acc.len() { Some(b.alloc_qubit()) } else { None };
-        let mut extended = a.to_vec();
-        if let Some(q) = pad { extended.push(q); }
         let cin = b.alloc_qubit();
-        cuccaro_add(b, &extended, acc, cin);
+        cuccaro_add_fast(b, a, acc, cin);
         b.free(cin);
-        if let Some(q) = pad { b.free(q); }
         return;
     }
     cuccaro_add_fast_zero(b, a, acc);
@@ -1206,13 +1202,9 @@ fn add_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
 fn sub_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     assert!(a.len() == acc.len() || a.len() + 1 == acc.len());
     if b.active_qubits as usize + acc.len().saturating_sub(1) > WORKSPACE_SOFT_LIMIT {
-        let pad = if a.len() < acc.len() { Some(b.alloc_qubit()) } else { None };
-        let mut extended = a.to_vec();
-        if let Some(q) = pad { extended.push(q); }
         let cin = b.alloc_qubit();
-        cuccaro_sub(b, &extended, acc, cin);
+        cuccaro_sub_fast(b, a, acc, cin);
         b.free(cin);
-        if let Some(q) = pad { b.free(q); }
         return;
     }
     cuccaro_sub_fast_zero(b, a, acc);
