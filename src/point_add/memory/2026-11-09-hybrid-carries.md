@@ -70,3 +70,11 @@ This avoids unnecessary low-block overflow cleanup. Combined with budget2331,
 2,331 qubits, product 8,952,128,577; zero coordinate/phase/ancilla failures.
 The sparse controlled-constant test now varies room around full, half and
 tight capacities, including cases that actually select the changed split.
+
+Increment splitting promoted as cdedc44b-c527-4ded-9009-b40192d190b5,
+source 49b0256aee3a33bfb952e905ccfa8993b395814f; normal sync completed.
+A new geometry scan selects 2332 among 2270..2340 step-two plus 2331/2333.
+The 2332 follow-up passes 9,024 shots at 3,838,706 Toffolis, 2,332 qubits,
+product 8,951,862,392. It saves 1,761 Toffolis for one added qubit.
+The proposed always-first-measured comparator fallback passes tests but
+has no full-circuit resource effect here; excluded and cached separately.
