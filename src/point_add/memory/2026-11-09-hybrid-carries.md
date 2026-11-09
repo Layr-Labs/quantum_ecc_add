@@ -44,3 +44,13 @@ and calls the hybrid pair instead of the all-unitary fallback; short addends
 need no physical top padding. The seventeen-test suite passes with added
 high-occupancy equal-width/short-addend coverage through 256 bits. A geometry
 scan over 2240..2340 still selects 2333 among tested values.
+
+The wrapper follow-up promoted as 49b0fd0f-5fc2-4363-bd12-8c900180ca29,
+source 7e588e2d70b5eb6a798af0049a35750d01be9ea3, and normal sync completed.
+Partial carry storage in cmp_lt_into_fast then passed 18 primitive tests and
+all 9,024 full shots at 3,840,383 Toffolis, 2,333 qubits, 8,959,613,539.
+It must retain the first scratch (the specialized first step controls u[0]);
+only later steps can target u[i] directly. With no room, keep the old pure
+unitary comparator. Exhaustive tests check every capacity and both initial
+flag values at widths 1..6, input preservation, predicate XOR, double-call
+identity, zero phase, zero workspace and strict pre-reset checks.

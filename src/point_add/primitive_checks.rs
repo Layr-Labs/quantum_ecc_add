@@ -652,3 +652,46 @@ fn scaling_single_block_costs() {
         }
     }
 }
+
+#[test]
+fn exhaustive_partial_carry_comparator() {
+    for n in 1..=6 {
+        for room in 0..=n {
+            let mut b=B::new();
+            let u=b.alloc_qubits(n); let v=b.alloc_qubits(n); let flag=b.alloc_qubit();
+            let _context=b.alloc_qubits(WORKSPACE_SOFT_LIMIT-b.active_qubits as usize-room);
+            cmp_lt_into_fast(&mut b,&u,&v,flag);
+            let boundary=b.ops.len();
+            cmp_lt_into_fast(&mut b,&u,&v,flag);
+            let ur:Vec<_>=u.iter().copied().map(QubitOrBit::Qubit).collect();
+            let vr:Vec<_>=v.iter().copied().map(QubitOrBit::Qubit).collect();
+            let mut xof=Shake256::default().finalize_xof();
+            let mut sim=Simulator::new(b.next_qubit as usize,b.next_bit as usize,&mut xof);
+            let cases=1usize<<(2*n+1); let mask=(1usize<<n)-1;
+            for first in (0..cases).step_by(64) {
+                sim.clear_for_shot(); let lanes=64.min(cases-first);
+                for lane in 0..lanes {
+                    let case=first+lane;
+                    sim.set_register(&ur,U256::from((case>>1)&mask),lane);
+                    sim.set_register(&vr,U256::from(case>>(n+1)),lane);
+                    sim.qubits[flag.0 as usize]|=((case&1) as u64)<<lane;
+                }
+                for (ops,inverted) in [(&b.ops[..boundary],true),(&b.ops[boundary..],false)] {
+                    apply_clean(&mut sim,ops); assert_eq!(sim.phase,0);
+                    for lane in 0..lanes {
+                        let case=first+lane; let uv=(case>>1)&mask; let vv=case>>(n+1);
+                        assert_eq!(sim.get_register(&ur,lane),U256::from(uv));
+                        assert_eq!(sim.get_register(&vr,lane),U256::from(vv));
+                        let predicate=usize::from(inverted && uv<vv);
+                        assert_eq!((sim.qubit(flag)>>lane)&1,((case&1)^predicate) as u64);
+                    }
+                    for q in 0..b.next_qubit {
+                        if !u.contains(&QubitId(q)) && !v.contains(&QubitId(q)) && QubitId(q)!=flag {
+                            assert_eq!(sim.qubits[q as usize],0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

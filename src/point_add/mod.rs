@@ -2203,12 +2203,16 @@ fn cmp_lt_into_fast(b: &mut B, u: &[QubitId], v: &[QubitId], flag: QubitId) {
         return;
     }
     let n = u.len();
-    if b.active_qubits as usize + n > WORKSPACE_SOFT_LIMIT {
+    // Keep the first scratch: its specialized zero-carry step uses u[0]
+    // as a control and cannot target that same wire. Later MAJ steps can
+    // independently choose scratch-based or in-place reversible cleanup.
+    let count=WORKSPACE_SOFT_LIMIT.saturating_sub(b.active_qubits as usize).min(n);
+    if count == 0 {
         cmp_lt_into(b, u, v, flag);
         return;
     }
     assert_eq!(n, v.len());
-    let carries = b.alloc_qubits(n);
+    let carries = b.alloc_qubits(count);
     for i in 0..n {
         b.x(u[i]);
     }
@@ -2220,18 +2224,22 @@ fn cmp_lt_into_fast(b: &mut B, u: &[QubitId], v: &[QubitId], flag: QubitId) {
     for i in 1..n {
         b.cx(u[i], v[i]);
         b.cx(u[i], u[i - 1]);
-        b.ccx(u[i - 1], v[i], carries[i]);
-        b.cx(carries[i], u[i]);
+        if i < count {
+            b.ccx(u[i - 1], v[i], carries[i]);
+            b.cx(carries[i], u[i]);
+        } else { b.ccx(u[i-1],v[i],u[i]); }
     }
 
     b.cx(u[n - 1], flag);
 
     // Backward inv_MAJ with measurement
     for i in (1..n).rev() {
-        b.cx(carries[i], u[i]);
-        let m = b.alloc_bit();
-        b.hmr(carries[i], m);
-        b.cz_if(u[i - 1], v[i], m);
+        if i < count {
+            b.cx(carries[i], u[i]);
+            let m = b.alloc_bit();
+            b.hmr(carries[i], m);
+            b.cz_if(u[i - 1], v[i], m);
+        } else { b.ccx(u[i-1],v[i],u[i]); }
         b.cx(u[i], u[i - 1]);
         b.cx(u[i], v[i]);
     }
