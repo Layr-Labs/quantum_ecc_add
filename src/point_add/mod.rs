@@ -1059,46 +1059,18 @@ fn cuccaro_add_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
         return;
     }
     if n == 1 {
-        b.cx(a[0], acc[0]);
+        if !a.is_empty() {b.cx(a[0], acc[0]);}
         return;
     }
 
-    if a.len() + 1 == n {
-        if n == 2 {
-            b.ccx(a[0], acc[0], acc[1]);
-            b.cx(a[0], acc[0]);
-            return;
-        }
-        let carries = b.alloc_qubits(n - 2);
-        b.cx(a[0], acc[0]);
-        b.ccx(a[0], acc[0], carries[0]);
-        b.cx(carries[0], a[0]);
-        for i in 1..n-2 {
-            b.cx(a[i], acc[i]);
-            b.cx(a[i], a[i-1]);
-            b.ccx(a[i-1], acc[i], carries[i]);
-            b.cx(carries[i], a[i]);
-        }
-        maj(b, a[n-3], acc[n-2], a[n-2]);
-        b.cx(a[n-2], acc[n-1]);
-        uma(b, a[n-3], acc[n-2], a[n-2]);
-        for i in (1..n-2).rev() {
-            b.cx(carries[i], a[i]);
-            let m = b.alloc_bit();
-            b.hmr(carries[i], m);
-            b.cz_if(a[i-1], acc[i], m);
-            b.cx(a[i], a[i-1]);
-            b.cx(a[i-1], acc[i]);
-        }
-        b.cx(carries[0], a[0]);
-        let m = b.alloc_bit();
-        b.hmr(carries[0], m);
-        b.cz_if(a[0], acc[0], m);
-        b.free_vec(&carries);
-        return;
+    if a.len()+1==n && n==2 {
+        b.ccx(a[0],acc[0],acc[1]); b.cx(a[0],acc[0]); return;
     }
 
-    let carries = b.alloc_qubits(n - 1);
+    // The first specialized step requires a scratch, but it replaces the
+    // fallback's explicit zero carry-input wire with the same footprint.
+    let count=WORKSPACE_SOFT_LIMIT.saturating_sub(b.active_qubits as usize).min(n-1).max(1);
+    let carries = b.alloc_qubits(count);
 
     // Forward MAJ sweep with carry ancillae.
     // Step 0: MAJ(c_in, acc[0], a[0]) → carry into carries[0]
@@ -1109,8 +1081,10 @@ fn cuccaro_add_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     for i in 1..n - 1 {
         b.cx(a[i], acc[i]);
         b.cx(a[i], a[i - 1]);
-        b.ccx(a[i - 1], acc[i], carries[i]);
-        b.cx(carries[i], a[i]);
+        if i<count {
+            b.ccx(a[i - 1], acc[i], carries[i]);
+            b.cx(carries[i], a[i]);
+        } else {b.ccx(a[i-1],acc[i],a[i]);}
     }
 
     // Final sum bit (same as original cuccaro_add)
@@ -1121,10 +1095,12 @@ fn cuccaro_add_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
 
     // Backward UMA sweep with measurement-based carry uncompute (0 Toffoli).
     for i in (1..n - 1).rev() {
-        b.cx(carries[i], a[i]);
-        let m = b.alloc_bit();
-        b.hmr(carries[i], m);
-        b.cz_if(a[i - 1], acc[i], m);
+        if i<count {
+            b.cx(carries[i], a[i]);
+            let m = b.alloc_bit();
+            b.hmr(carries[i], m);
+            b.cz_if(a[i - 1], acc[i], m);
+        } else {b.ccx(a[i-1],acc[i],a[i]);}
         b.cx(a[i], a[i - 1]);
         b.cx(a[i - 1], acc[i]);
     }
@@ -1145,11 +1121,18 @@ fn cuccaro_sub_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
         return;
     }
     if n == 1 {
-        b.cx(a[0], acc[0]);
+        if !a.is_empty() {b.cx(a[0], acc[0]);}
         return;
     }
 
-    let carries = b.alloc_qubits(n - 1);
+    if a.len()+1==n && n==2 {
+        b.cx(a[0],acc[0]); b.ccx(a[0],acc[0],acc[1]); return;
+    }
+
+    // The first specialized step requires a scratch, but it replaces the
+    // fallback's explicit zero carry-input wire with the same footprint.
+    let count=WORKSPACE_SOFT_LIMIT.saturating_sub(b.active_qubits as usize).min(n-1).max(1);
+    let carries = b.alloc_qubits(count);
 
     // Forward inv_UMA sweep with carry ancillae (reversed UMA from cuccaro_sub).
     // Step 0:
@@ -1159,8 +1142,10 @@ fn cuccaro_sub_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     for i in 1..n - 1 {
         b.cx(a[i - 1], acc[i]);
         b.cx(a[i], a[i - 1]);
-        b.ccx(a[i - 1], acc[i], carries[i]);
-        b.cx(carries[i], a[i]);
+        if i<count {
+            b.ccx(a[i - 1], acc[i], carries[i]);
+            b.cx(carries[i], a[i]);
+        } else {b.ccx(a[i-1],acc[i],a[i]);}
     }
 
     // Final sum bit (reversed from cuccaro_add)
@@ -1171,10 +1156,12 @@ fn cuccaro_sub_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
 
     // Backward inv_MAJ sweep with measurement.
     for i in (1..n - 1).rev() {
-        b.cx(carries[i], a[i]);
-        let m = b.alloc_bit();
-        b.hmr(carries[i], m);
-        b.cz_if(a[i - 1], acc[i], m);
+        if i<count {
+            b.cx(carries[i], a[i]);
+            let m = b.alloc_bit();
+            b.hmr(carries[i], m);
+            b.cz_if(a[i - 1], acc[i], m);
+        } else {b.ccx(a[i-1],acc[i],a[i]);}
         b.cx(a[i], a[i - 1]);
         b.cx(a[i], acc[i]);
     }
@@ -1190,24 +1177,12 @@ fn cuccaro_sub_fast_zero(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
 /// Fast `acc += a mod 2^n` using measurement-based Cuccaro.
 fn add_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     assert!(a.len() == acc.len() || a.len() + 1 == acc.len());
-    if b.active_qubits as usize + acc.len().saturating_sub(1) > WORKSPACE_SOFT_LIMIT {
-        let cin = b.alloc_qubit();
-        cuccaro_add_fast(b, a, acc, cin);
-        b.free(cin);
-        return;
-    }
     cuccaro_add_fast_zero(b, a, acc);
 }
 
 /// Fast `acc -= a mod 2^n` using measurement-based Cuccaro.
 fn sub_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
     assert!(a.len() == acc.len() || a.len() + 1 == acc.len());
-    if b.active_qubits as usize + acc.len().saturating_sub(1) > WORKSPACE_SOFT_LIMIT {
-        let cin = b.alloc_qubit();
-        cuccaro_sub_fast(b, a, acc, cin);
-        b.free(cin);
-        return;
-    }
     cuccaro_sub_fast_zero(b, a, acc);
 }
 

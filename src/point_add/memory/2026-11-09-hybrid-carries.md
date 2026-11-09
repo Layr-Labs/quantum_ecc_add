@@ -125,3 +125,16 @@ score8,796,357,636; zero coordinate/phase/ancilla failures. Peak moved back
 to kara_fwd. A fresh budget scan2316..2340 still selects2332 among tested
 values;2330 is close at8,796,493,270 but worse. Temporary scan overrides
 are excluded by restoring the exact measured production source.
+
+Short-term padding submission promoted as 6d36f0a9-eb22-4cfd-9b47-bde8afc6036d,
+source8b5874f3570c7dfe80eac2e7e5e72b80d4b959e2; normal sync completed.
+Zero-carry add/sub specializations now directly support partial measured
+prefixes and unitary later steps. Their mandatory first scratch replaces the
+old fallback's explicit zero carry-input wire. Generic wrappers call them
+directly; short two-bit operations use direct one-Toffoli circuits, and the
+empty-addend one-bit case is covered. Exhaustive small tests now force every
+capacity and both widths/directions. All19 tests and9,024 fullshots pass at
+3,771,813 Toffolis,2332 qubits,score8,795,867,916; zero failures. Next: q<=c
+means compact correction c*q<c²<2^65, so product_fold's 66-bit temporary may
+be reducible to65 bits; the generic clean-scale helper still needs its wider
+range for arbitrary q and must not be globally narrowed.

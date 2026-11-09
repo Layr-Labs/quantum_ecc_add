@@ -6,15 +6,17 @@ fn exhaustive_small_direct_arithmetic() {
     // This checks both arithmetic and measurement-induced phase cancellation.
     for n in 1..=6 {
         for short in [false, true] {
-            if short && n == 1 { continue; }
             let aw = n - usize::from(short);
             for subtract in [false, true] {
+              for room in 0..=n {
                 let mut b = B::new();
                 let a = b.alloc_qubits(aw);
                 let acc = b.alloc_qubits(n);
+                let _context=b.alloc_qubits(WORKSPACE_SOFT_LIMIT-b.active_qubits as usize-room);
                 if subtract { cuccaro_sub_fast_zero(&mut b, &a, &acc); }
                 else { cuccaro_add_fast_zero(&mut b, &a, &acc); }
                 check_all(&b, &a, &acc, n, subtract, None);
+              }
             }
         }
         for c in 0..1u64 << n {
