@@ -135,6 +135,15 @@ directly; short two-bit operations use direct one-Toffoli circuits, and the
 empty-addend one-bit case is covered. Exhaustive small tests now force every
 capacity and both widths/directions. All19 tests and9,024 fullshots pass at
 3,771,813 Toffolis,2332 qubits,score8,795,867,916; zero failures. Next: q<=c
-means compact correction c*q<c²<2^65, so product_fold's 66-bit temporary may
+means compact correction c*q<=c²<2^65, so product_fold's 66-bit temporary may
 be reducible to65 bits; the generic clean-scale helper still needs its wider
 range for arbitrary q and must not be globally narrowed.
+
+Zero-carry submission promoted as f1df942b-d7cf-422d-b7a4-b37d2c67a176,
+sourceebc112a536bafd2a502442fd2327009cfce62540; normal sync completed.
+Private fold correction product narrowed66->65: q<=c, c*q<=c²<2^65.
+All19 tests and9,024 fullshots pass at3,771,649 Toffolis,2332 qubits,
+score8,795,485,468, zero failures. Generic clean-scale q range remains
+unrestricted, so its wider product must stay. The earlier memory strict
+inequality c*q<c² was a wording error; q=c is possible and is exercised by
+maximal raw limbs. The valid final-width bound is the nonstrict form above.

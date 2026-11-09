@@ -15,7 +15,10 @@ fn add_high(b: &mut B, high: &[QubitId], wide: &[QubitId], inverse: bool) {
 }
 
 fn add_small_product(b: &mut B, q: &[QubitId], wide: &[QubitId], inverse: bool) {
-    let product=b.alloc_qubits(66);
+    // The first fold guarantees q<=c, hence c*q<=c*c<2^65.
+    // Signed intermediate terms may wrap modulo this width, but the final
+    // nonnegative correction product fits without discarding information.
+    let product=b.alloc_qubits(65);
     clean_scale::solinas_product(b,q,&product,false);
     if inverse {sub_zero_extended(b,&product,wide);}
     else {add_zero_extended(b,&product,wide);}
